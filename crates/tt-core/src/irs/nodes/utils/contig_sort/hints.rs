@@ -435,7 +435,9 @@ fn diff_input_on_ordered_explicit(
         out_fields.push(Field::new(
             name,
             diff_output_type(field.data_type()),
-            field.is_nullable(),
+            // Match the verifier's witness schema. Nullability admission is
+            // checked on source keys, never inferred from difference hints.
+            true,
         ));
         out_cols.push(diff_col);
     }
@@ -484,7 +486,8 @@ fn is_explicit_diff_type(data_type: &DataType) -> bool {
     )
 }
 
-fn materialize_diff_array(
+/// Materialize a difference hint, widening integer/date subtraction first.
+pub(super) fn materialize_diff_array(
     data_type: &DataType,
     lhs: &dyn Array,
     rhs: &dyn Array,

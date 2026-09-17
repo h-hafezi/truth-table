@@ -40,7 +40,11 @@ use crate::{
 };
 #[cfg(test)]
 mod difference_tests;
+#[cfg(test)]
+mod encoding_tests;
 mod hints;
+#[cfg(test)]
+mod nullable_tests;
 
 /// Labels for different gadget payloads used by this gadget.
 pub const TABLE_LABEL: &str = "__input__";
@@ -203,7 +207,7 @@ fn initialize_gadget_plans<B: SnarkBackend>(
     // A comparison hint is not a proof of ordering. Reject types whose
     // comparison cannot yet be bound to field subtraction on both sides.
     for field in ordered_data_fields_for_hint(&input_hint, &sort_specs) {
-        checked_difference_type::<B>(field.data_type())?;
+        checked_difference_field::<B>(&field)?;
     }
     let sorted_input_hint = if is_verifier {
         build_schema_only_hint_from_existing(&input_hint)
@@ -345,6 +349,18 @@ impl<B: SnarkBackend> ProverNodeOps<B> for GadgetNode<B> {
         let diff_table = payload.get(DIFF_INPUT_LABEL);
         let tie_table = payload.get(TIE_INDICATOR_LABEL);
 
+        // Validate source metadata even if comparison hints are absent. NULL
+        // validity is not represented by the field encoding, so a witness-side
+        // check (or a claim that its difference column is nonnullable) is not enough.
+        if let Some(input) = input_table {
+            let sort_specs = sort_specs_for_table_prover(&self.sort_config, input);
+            for index in ordered_data_indices_prover(input, &sort_specs) {
+                let field = input.tracked_col_by_ind(index).field_ref().ok_or_else(|| {
+                    ark_piop::errors::SnarkError::Artifact("sort key has no field metadata".into())
+                })?;
+                checked_difference_field::<B>(&field)?;
+            }
+        }
         if let (Some(left), Some(right)) = (input_table, rotated_table) {
             populate_prescr_perm_payloads_prover(
                 &self.prescr_perm,
@@ -453,6 +469,22 @@ impl<B: SnarkBackend> VerifierNodeOps<B> for GadgetNode<B> {
         let diff_table = payload.get(DIFF_INPUT_LABEL);
         let tie_table = payload.get(TIE_INDICATOR_LABEL);
 
+        // This is verifier-owned source metadata, not a prover-supplied
+        // difference schema. Enforce the same policy without trusting the prover.
+        if let Some(input) = input_table {
+            let sort_specs = sort_specs_for_table_verifier(&self.sort_config, input);
+            for index in ordered_data_indices_verifier(input, &sort_specs) {
+                let field = input
+                    .tracked_col_oracle_by_ind(index)
+                    .field_ref()
+                    .ok_or_else(|| {
+                        ark_piop::errors::SnarkError::Artifact(
+                            "sort key has no field metadata".into(),
+                        )
+                    })?;
+                checked_difference_field::<B>(&field)?;
+            }
+        }
         if input_table.is_some() && rotated_table.is_none() {
             panic!("Expected rotated input payload for Sort gadget");
         }
@@ -817,10 +849,10 @@ fn build_verifier_tie_hint_from_ordered(
     let fields = if ordered_data_fields.is_empty() {
         Vec::new()
     } else if ordered_data_fields.len() == 1 {
-        vec![Field::new("tie_0", DataType::Boolean, true)]
+        vec![Field::new("tie_0", DataType::Boolean, false)]
     } else {
         (1..ordered_data_fields.len())
-            .map(|idx| Field::new(format!("tie_{idx}"), DataType::Boolean, true))
+            .map(|idx| Field::new(format!("tie_{idx}"), DataType::Boolean, false))
             .collect()
     };
     build_empty_hint_df_with_fields(fields, true)
@@ -882,7 +914,8 @@ fn diff_output_type(data_type: &DataType) -> DataType {
 /// binding comparison reduction is available. Decimal inputs also remain
 /// unsupported: their negative encoder currently uses unsigned two's-complement
 /// values rather than signed field values. These are deliberate fail-closed
-/// restrictions, not a claim about SQL collation/NULLs.
+/// restrictions, not a claim about SQL collation. Source nullability is checked
+/// separately by `checked_difference_field`.
 fn checked_difference_type<B: SnarkBackend>(
     data_type: &DataType,
 ) -> ark_piop::errors::SnarkResult<DataType> {
@@ -907,6 +940,24 @@ fn checked_difference_type<B: SnarkBackend>(
         return Err(unsupported());
     }
     Ok(result)
+}
+
+/// Reject nullable source keys until NULL validity and ordering are encoded.
+/// This conservative schema-level policy also rejects nullable columns whose
+/// current entries happen to be non-NULL. It never inspects hint values to infer
+/// a verifier prerequisite, and it must not be applied to nullable diff hints.
+fn checked_difference_field<B: SnarkBackend>(
+    field: &Field,
+) -> ark_piop::errors::SnarkResult<DataType> {
+    if field.is_nullable() {
+        return Err(ark_piop::errors::SnarkError::DataTypeError(
+            ark_piop::arithmetic::errors::DataTypeError::NotSupported(format!(
+                "contiguous-sort requires non-nullable sort keys; NULL-aware ordering is unsupported: {}",
+                field.name()
+            )),
+        ));
+    }
+    checked_difference_type::<B>(field.data_type())
 }
 
 fn build_verifier_diff_hint_from_ordered(
@@ -1148,7 +1199,7 @@ fn populate_sign_payloads_prover<B: SnarkBackend>(
             .expect("Expected field ref for Sort sign input");
         let diff_field = Field::new(
             input_field.name(),
-            checked_difference_type::<B>(input_field.data_type())?,
+            checked_difference_field::<B>(&input_field)?,
             false,
         );
         let expected_diff = if is_asc {
@@ -1277,7 +1328,7 @@ fn populate_sign_payloads_verifier<B: SnarkBackend>(
             .expect("Expected field ref for Sort sign input");
         let diff_field = Field::new(
             input_field.name(),
-            checked_difference_type::<B>(input_field.data_type())?,
+            checked_difference_field::<B>(&input_field)?,
             false,
         );
         let expected_diff = if is_asc {
@@ -1927,17 +1978,9 @@ fn pad_df_to_power_of_two(
 ) -> datafusion_common::Result<datafusion::prelude::DataFrame> {
     let schema_ref = df.schema();
     let arrow_schema: Schema = <DFSchema as AsRef<Schema>>::as_ref(schema_ref).clone();
-    let arrow_schema = Schema::new_with_metadata(
-        arrow_schema
-            .fields()
-            .iter()
-            .map(|field| {
-                Field::new(field.name(), field.data_type().clone(), true)
-                    .with_metadata(field.metadata().clone())
-            })
-            .collect::<Vec<_>>(),
-        arrow_schema.metadata().clone(),
-    );
+    // Preserve source nullability: padding repeats existing values, or uses a
+    // non-NULL zero for an empty nonnullable column. Making every field nullable
+    // here would reject valid source schemas and disagree with verifier planning.
     let batches = collect_blocking(df)?;
     let (batches, _row_count) = pad_batches_to_power_of_two(&arrow_schema, batches)?;
     if batches.is_empty() {
@@ -2041,7 +2084,8 @@ fn pad_batches_to_power_of_two(
             let start = combined
                 .as_ref()
                 .and_then(|batch| {
-                    ScalarValue::try_from_array(batch.column(idx).as_ref(), row_count - 1).ok()
+                    let last = row_count.checked_sub(1)?;
+                    ScalarValue::try_from_array(batch.column(idx).as_ref(), last).ok()
                 })
                 .and_then(|val| match val {
                     ScalarValue::Int64(Some(v)) => Some(v + 1),
@@ -2052,7 +2096,7 @@ fn pad_batches_to_power_of_two(
             let pad_vals: Vec<i64> = (0..pad as i64).map(|offset| start + offset).collect();
             let pad_arr: ArrayRef = Arc::new(Int64Array::from(pad_vals));
             concat(&[base.as_ref(), pad_arr.as_ref()])?
-        } else if let Some(batch) = combined.as_ref() {
+        } else if let Some(batch) = combined.as_ref().filter(|batch| batch.num_rows() > 0) {
             let base = batch.column(idx).clone();
             // Repeat the last value for padded rows. This keeps arithmetic constraints
             // stable under padding and matches existing gadget expectations.
@@ -2060,8 +2104,12 @@ fn pad_batches_to_power_of_two(
             let pad_arr = last.to_array_of_size(pad)?;
             concat(&[base.as_ref(), pad_arr.as_ref()])?
         } else {
-            let null = ScalarValue::try_new_null(field.data_type())?;
-            null.to_array_of_size(pad)?
+            let value = if field.is_nullable() {
+                ScalarValue::try_new_null(field.data_type())?
+            } else {
+                ScalarValue::new_zero(field.data_type())?
+            };
+            value.to_array_of_size(pad)?
         };
         output_arrays.push(padded);
     }
