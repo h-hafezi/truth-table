@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arithmetic::{
     ACTIVATOR_FIELD, ROW_ID_COL_NAME, table::TrackedTable, table_oracle::TrackedTableOracle,
 };
-use ark_ff::{One, Zero};
+use ark_ff::{One, PrimeField, Zero};
 use ark_piop::SnarkBackend;
 use ark_piop::arithmetic::mat_poly::utils::{build_eq_x_r, build_sparse_eq_x_r};
 use ark_piop::prover::structs::polynomial::get_or_insert_shift_poly;
@@ -38,6 +38,8 @@ use crate::{
     prover::irs::GadgetReadyIr,
     verifier::irs::GadgetReadyIr as VerifierGadgetReadyIr,
 };
+#[cfg(test)]
+mod difference_tests;
 mod hints;
 
 /// Labels for different gadget payloads used by this gadget.
@@ -198,6 +200,11 @@ fn initialize_gadget_plans<B: SnarkBackend>(
         None => return Ok(()),
     };
     let sort_specs = sort_specs_for_hint(&node.sort_config, &input_hint);
+    // A comparison hint is not a proof of ordering. Reject types whose
+    // comparison cannot yet be bound to field subtraction on both sides.
+    for field in ordered_data_fields_for_hint(&input_hint, &sort_specs) {
+        checked_difference_type::<B>(field.data_type())?;
+    }
     let sorted_input_hint = if is_verifier {
         build_schema_only_hint_from_existing(&input_hint)
     } else {
@@ -388,6 +395,7 @@ impl<B: SnarkBackend> ProverNodeOps<B> for GadgetNode<B> {
             // Prefer precomputed diffs so sign gadgets operate on bounded values.
             let sort_specs = sort_specs_for_table_prover(&self.sort_config, input_table);
             populate_sign_payloads_prover(
+                prover,
                 &self.sign_gadget,
                 &self.sort_config,
                 &sort_specs,
@@ -490,6 +498,7 @@ impl<B: SnarkBackend> VerifierNodeOps<B> for GadgetNode<B> {
         {
             let sort_specs = sort_specs_for_table_verifier(&self.sort_config, input_table);
             populate_sign_payloads_verifier(
+                verifier,
                 &self.sign_gadget,
                 &self.sort_config,
                 &sort_specs,
@@ -837,8 +846,23 @@ fn is_numeric_diff_type(data_type: &DataType) -> bool {
 }
 
 fn diff_output_type(data_type: &DataType) -> DataType {
-    if data_type == &DataType::Date32 {
-        DataType::Int32
+    if matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Date32
+    ) {
+        // Signed differences need one more bit than their input type; this
+        // also represents the negative cyclic-wrap difference without overflow.
+        DataType::Decimal128(20, 0)
+    } else if let DataType::Decimal128(precision, scale) = data_type {
+        DataType::Decimal128(precision.saturating_add(1).min(38), *scale)
     } else if is_numeric_diff_type(data_type) {
         data_type.clone()
     } else {
@@ -853,12 +877,36 @@ fn diff_output_type(data_type: &DataType) -> DataType {
     }
 }
 
-/// True when the diff column for `data_type` is emitted as the
-/// `{0, 1, 2}` shifted sign-only encoding (see `diff_output_type`).
-/// Callers of the sign gadget must subtract `1` from the tracked diff
-/// to recover the natural `{-1, 0, 1}` sign semantics.
-pub(crate) fn is_sign_only_diff(data_type: &DataType) -> bool {
-    data_type != &DataType::Date32 && !is_numeric_diff_type(data_type)
+/// The sign-check range is derived from the input schema, never a witness.
+/// Strings, floats, and Boolean sign-only hints remain unsupported until a
+/// binding comparison reduction is available. Decimal inputs also remain
+/// unsupported: their negative encoder currently uses unsigned two's-complement
+/// values rather than signed field values. These are deliberate fail-closed
+/// restrictions, not a claim about SQL collation/NULLs.
+fn checked_difference_type<B: SnarkBackend>(
+    data_type: &DataType,
+) -> ark_piop::errors::SnarkResult<DataType> {
+    let unsupported = || {
+        ark_piop::errors::SnarkError::DataTypeError(
+            ark_piop::arithmetic::errors::DataTypeError::NotSupported(format!(
+                "bound contiguous-sort difference for {data_type}"
+            )),
+        )
+    };
+    let result = match data_type {
+        DataType::Int8 | DataType::UInt8 => DataType::UInt8,
+        DataType::Int16 | DataType::UInt16 => DataType::UInt16,
+        DataType::Int32 | DataType::UInt32 | DataType::Date32 => DataType::UInt32,
+        DataType::Int64 | DataType::UInt64 => DataType::UInt64,
+        _ => return Err(unsupported()),
+    };
+    // Keep a generous separation between these at-most-64-bit differences
+    // and the field modulus, so a negative difference cannot wrap into
+    // Sign's nonnegative range.
+    if B::F::MODULUS_BIT_SIZE <= 128 {
+        return Err(unsupported());
+    }
+    Ok(result)
 }
 
 fn build_verifier_diff_hint_from_ordered(
@@ -1024,6 +1072,7 @@ fn sort_is_asc(sort_specs: &[(String, bool, bool)], col_name: &str) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn populate_sign_payloads_prover<B: SnarkBackend>(
+    prover: &mut ArgProver<B>,
     sign_gadget: &Arc<Node<B>>,
     sort_config: &SortConfig,
     sort_specs: &[(String, bool, bool)],
@@ -1036,17 +1085,20 @@ fn populate_sign_payloads_prover<B: SnarkBackend>(
     let tie_indices = tie_table.data_tracked_polys_indices();
     let input_indices = ordered_data_indices_prover(input_table, sort_specs);
     let rotated_indices = ordered_data_indices_prover(rotated_table, sort_specs);
-    debug_assert_eq!(
-        tie_indices.len(),
-        input_indices.len(),
-        "Sort sign gadget expects one tie indicator per data column."
-    );
-    debug_assert_eq!(
-        input_indices.len(),
-        rotated_indices.len(),
-        "Sort sign gadget expects matching input and rotated column counts."
-    );
     let diff_indices = diff_table.map(|table| ordered_data_indices_prover(table, sort_specs));
+    if tie_indices.len() != input_indices.len()
+        || rotated_indices.len() != input_indices.len()
+        || diff_indices
+            .as_ref()
+            .is_some_and(|indices| indices.len() != input_indices.len())
+        || rotated_table.log_size() != input_table.log_size()
+        || tie_table.log_size() != input_table.log_size()
+        || diff_table.is_some_and(|table| table.log_size() != input_table.log_size())
+    {
+        return Err(ark_piop::errors::SnarkError::Artifact(
+            "contiguous-sort difference payload shape mismatch".into(),
+        ));
+    }
 
     let mut data_cols = IndexMap::new();
     let input_activator = input_table.activator_tracked_poly();
@@ -1083,61 +1135,41 @@ fn populate_sign_payloads_prover<B: SnarkBackend>(
             }
         };
 
-        // Prefer precomputed diff columns when available; they are generated from
-        // the same sorted hint relation used by contig-sort planning.
+        // Precomputed differences are witnesses: the zerocheck below binds
+        // them to the actual, direction-sensitive adjacent subtraction.
         let diff_from_payload = diff_table.and_then(|table| {
             diff_indices
                 .as_ref()
                 .and_then(|inds| inds.get(pos).copied())
                 .map(|idx| table.tracked_col_by_ind(idx))
         });
-        let input_field_type = input_col
+        let input_field = input_col
             .field_ref()
-            .expect("Expected field ref for Sort sign input")
-            .data_type()
-            .clone();
-        let (raw_diff_poly, diff_field) = if let Some(diff_col) = diff_from_payload {
-            (
-                diff_col.data_tracked_poly(),
-                diff_col
-                    .field_ref()
-                    .expect("Expected field ref for Sort diff input")
-                    .as_ref()
-                    .clone(),
-            )
-        } else if is_asc {
-            (
-                &rotated_col.data_tracked_poly() - &input_col.data_tracked_poly(),
-                input_col
-                    .field_ref()
-                    .expect("Expected field ref for Sort sign input")
-                    .as_ref()
-                    .clone(),
-            )
+            .expect("Expected field ref for Sort sign input");
+        let diff_field = Field::new(
+            input_field.name(),
+            checked_difference_type::<B>(input_field.data_type())?,
+            false,
+        );
+        let expected_diff = if is_asc {
+            &rotated_col.data_tracked_poly() - &input_col.data_tracked_poly()
         } else {
-            (
-                &input_col.data_tracked_poly() - &rotated_col.data_tracked_poly(),
-                input_col
-                    .field_ref()
-                    .expect("Expected field ref for Sort sign input")
-                    .as_ref()
-                    .clone(),
-            )
+            &input_col.data_tracked_poly() - &rotated_col.data_tracked_poly()
         };
-
-        // Sign-only diff columns arrive as `{0, 1, 2}` shifted from the
-        // natural `{-1, 0, 1}` (see `diff_output_type` / `is_sign_only_diff`
-        // for the memory rationale). Undo the +1 shift before the sign
-        // gadget consumes them so the field-arithmetic sign semantics
-        // are recovered. Subtracting a scalar is O(1) after the
-        // `add_scalar` virtualization in `ark_piop::prover::tracker`.
-        let diff_poly = if is_sign_only_diff(&input_field_type) {
-            raw_diff_poly.sub_scalar_poly(B::F::one())
-        } else {
-            raw_diff_poly
-        };
-
         let tie_poly = tie_col.data_tracked_poly();
+        let diff_poly = if let Some(diff_col) = diff_from_payload {
+            let diff = diff_col.data_tracked_poly();
+            let mut residual = &(&diff - &expected_diff) * &tie_poly;
+            if let Some(active) = &combined_activator {
+                residual = &residual * active;
+            }
+            // Bind exactly the adjacent comparisons consumed by Sign. Padding
+            // and the cyclic boundary are deliberately excluded by its masks.
+            prover.add_mv_zerocheck_claim(residual.id())?;
+            diff
+        } else {
+            expected_diff
+        };
         let one_poly = TrackedPoly::new(
             Either::Right(B::F::one()),
             tie_poly.log_size(),
@@ -1171,6 +1203,7 @@ fn populate_sign_payloads_prover<B: SnarkBackend>(
 
 #[allow(clippy::too_many_arguments)]
 fn populate_sign_payloads_verifier<B: SnarkBackend>(
+    verifier: &mut ArgVerifier<B>,
     sign_gadget: &Arc<Node<B>>,
     sort_config: &SortConfig,
     sort_specs: &[(String, bool, bool)],
@@ -1183,17 +1216,20 @@ fn populate_sign_payloads_verifier<B: SnarkBackend>(
     let tie_indices = tie_table.data_tracked_oracles_indices();
     let input_indices = ordered_data_indices_verifier(input_table, sort_specs);
     let rotated_indices = ordered_data_indices_verifier(rotated_table, sort_specs);
-    debug_assert_eq!(
-        tie_indices.len(),
-        input_indices.len(),
-        "Sort sign gadget expects one tie indicator per data column."
-    );
-    debug_assert_eq!(
-        input_indices.len(),
-        rotated_indices.len(),
-        "Sort sign gadget expects matching input and rotated column counts."
-    );
     let diff_indices = diff_table.map(|table| ordered_data_indices_verifier(table, sort_specs));
+    if tie_indices.len() != input_indices.len()
+        || rotated_indices.len() != input_indices.len()
+        || diff_indices
+            .as_ref()
+            .is_some_and(|indices| indices.len() != input_indices.len())
+        || rotated_table.log_size() != input_table.log_size()
+        || tie_table.log_size() != input_table.log_size()
+        || diff_table.is_some_and(|table| table.log_size() != input_table.log_size())
+    {
+        return Err(ark_piop::errors::SnarkError::Artifact(
+            "contiguous-sort difference payload shape mismatch".into(),
+        ));
+    }
 
     let mut data_cols = IndexMap::new();
     let input_activator = input_table.activator_tracked_poly();
@@ -1236,50 +1272,31 @@ fn populate_sign_payloads_verifier<B: SnarkBackend>(
                 .and_then(|inds| inds.get(pos).copied())
                 .map(|idx| table.tracked_col_oracle_by_ind(idx))
         });
-        let input_field_type = input_col
+        let input_field = input_col
             .field_ref()
-            .expect("Expected field ref for Sort sign input")
-            .data_type()
-            .clone();
-        let (raw_diff_oracle, diff_field) = if let Some(diff_col) = diff_from_payload {
-            (
-                diff_col.data_tracked_oracle(),
-                diff_col
-                    .field_ref()
-                    .expect("Expected field ref for Sort diff input")
-                    .as_ref()
-                    .clone(),
-            )
-        } else if is_asc {
-            (
-                &rotated_col.data_tracked_oracle() - &input_col.data_tracked_oracle(),
-                input_col
-                    .field_ref()
-                    .expect("Expected field ref for Sort sign input")
-                    .as_ref()
-                    .clone(),
-            )
+            .expect("Expected field ref for Sort sign input");
+        let diff_field = Field::new(
+            input_field.name(),
+            checked_difference_type::<B>(input_field.data_type())?,
+            false,
+        );
+        let expected_diff = if is_asc {
+            &rotated_col.data_tracked_oracle() - &input_col.data_tracked_oracle()
         } else {
-            (
-                &input_col.data_tracked_oracle() - &rotated_col.data_tracked_oracle(),
-                input_col
-                    .field_ref()
-                    .expect("Expected field ref for Sort sign input")
-                    .as_ref()
-                    .clone(),
-            )
+            &input_col.data_tracked_oracle() - &rotated_col.data_tracked_oracle()
         };
-
-        // Mirror the prover: undo the +1 shift applied to sign-only diff
-        // columns at emission time. See `is_sign_only_diff` and the
-        // prover-side wiring in `populate_sign_payloads_prover`.
-        let diff_oracle = if is_sign_only_diff(&input_field_type) {
-            raw_diff_oracle.sub_scalar_oracle(B::F::one())
-        } else {
-            raw_diff_oracle
-        };
-
         let tie_oracle = tie_col.data_tracked_oracle();
+        let diff_oracle = if let Some(diff_col) = diff_from_payload {
+            let diff = diff_col.data_tracked_oracle();
+            let mut residual = &(&diff - &expected_diff) * &tie_oracle;
+            if let Some(active) = &combined_activator {
+                residual = &residual * active;
+            }
+            verifier.add_mv_zerocheck_claim(residual.id());
+            diff
+        } else {
+            expected_diff
+        };
         let one_oracle = TrackedOracle::new(
             Either::Right(B::F::one()),
             tie_oracle.tracker(),
