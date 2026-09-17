@@ -6,6 +6,8 @@ pub const INPUT_RLC_LABEL: &str = "__input-rlc__";
 pub const OUTPUT_RLC_LABEL: &str = "__output-rlc__";
 pub mod avg;
 mod extremum;
+#[cfg(test)]
+mod extremum_tests;
 pub mod max;
 pub mod min;
 pub mod sum;

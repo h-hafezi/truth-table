@@ -17,6 +17,9 @@ pub const INPUT_LABEL: &str = "__input__";
 pub const OUTPUT_LABEL: &str = "__output__";
 const PREDICATE_COL_NAME: &str = "predicate";
 
+#[cfg(test)]
+mod tests;
+
 pub struct GadgetNode<B: SnarkBackend> {
     supp_gadget: Option<Arc<Node<B>>>,
     bool_gadget: Option<Arc<Node<B>>>,
