@@ -118,7 +118,7 @@ fn verify_supplied_prefix(
     if requires_all_input(limit, reported_output_count, NV).unwrap_or(false) {
         // Supply an unrelated true zerocheck, not the required input-output
         // relation. The verifier must enforce its own polynomial identity.
-        let fake_omitted_rows = &output_act - &output_act;
+        let fake_omitted_rows = output_act.mul_scalar_poly(F::from(0u64));
         harness
             .prover
             .add_mv_zerocheck_claim(fake_omitted_rows.id())
