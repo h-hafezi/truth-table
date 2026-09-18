@@ -90,7 +90,9 @@ fn ensure_supported_join(join: &Join) -> ark_piop::errors::SnarkResult<()> {
             })?;
         if left_field.is_nullable() || right_field.is_nullable() {
             return Err(unsupported_join_error(format!(
-                "key pair {key_index} is nullable, but NULL validity is not encoded"
+                "key pair {key_index} is nullable (left={}, right={}), but NULL validity is not encoded",
+                left_field.is_nullable(),
+                right_field.is_nullable(),
             )));
         }
         if left_field.data_type() != right_field.data_type() {
@@ -350,8 +352,8 @@ fn force_materialize_all(
 pub enum Gadgets<B: SnarkBackend> {
     // Full join proof stack: bool + nodup + match-pair utilities.
     ManyToMany(ManyToManyGadgets<B>),
-    // Optimized mode for joins where one side is guaranteed unique.
-    // No child gadgets are needed.
+    // Reserved representation for a future PK/FK-specific proof. It must not
+    // be selected until it constrains the materialized output relation.
     HasOne,
 }
 pub struct ManyToManyGadgets<B: SnarkBackend> {
@@ -1532,7 +1534,7 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
 }
 
 impl<B: SnarkBackend> GadgetNode<B> {
-    pub fn new(join: Join, join_mode: JoinMode) -> Self {
+    pub fn new(join: Join, _requested_mode: JoinMode) -> Self {
         let bool_gadget = Arc::new(Node::<B>::Gadget(Arc::new(
             crate::irs::nodes::utils::bool::GadgetNode::new(),
         )));
@@ -1542,19 +1544,15 @@ impl<B: SnarkBackend> GadgetNode<B> {
         let match_pair_gadget = Arc::new(Node::<B>::Gadget(Arc::new(
             crate::irs::nodes::utils::match_pair_check::GadgetNode::new(),
         )));
-        let mut gadgets = Gadgets::ManyToMany(ManyToManyGadgets {
+        let gadgets = Gadgets::ManyToMany(ManyToManyGadgets {
             bool_gadget,
             nodup_gadget,
             match_pair_gadget,
         });
-        // HasOne modes collapse join gadget internals to keep plan/gadget optimization aligned.
-        if join_mode != JoinMode::MANY_TO_MANY {
-            gadgets = Gadgets::HasOne;
-        }
         Self {
             gadgets: RwLock::new(gadgets),
             join,
-            join_mode: RwLock::new(join_mode),
+            join_mode: RwLock::new(JoinMode::MANY_TO_MANY),
         }
     }
 
@@ -1580,24 +1578,30 @@ impl<B: SnarkBackend> GadgetNode<B> {
             .unwrap_or(JoinMode::MANY_TO_MANY)
     }
 
-    pub fn set_join_mode(&self, mode: JoinMode) {
+    pub fn set_join_mode(&self, _requested_mode: JoinMode) {
+        // `HasOne` is not a proof protocol yet: it has no child gadgets and
+        // places no claims on materialized PK-side output columns. Silently
+        // selecting it would therefore bypass Join soundness. Retain the
+        // complete MatchPair/lookup/NoDup path until those variants acquire
+        // dedicated constraints.
+        let mode = JoinMode::MANY_TO_MANY;
         if let Ok(mut guard) = self.join_mode.write() {
             *guard = mode;
         }
-        if let Ok(mut gadgets) = self.gadgets.write() {
+        if let Ok(gadgets) = self.gadgets.read() {
             // Never rebuild MANY_TO_MANY children here: creating fresh child nodes would
             // change node ids and break IR payload maps keyed by existing ids.
-            // Optimized modes collapse the join gadget into a no-op (no child gadgets).
-            if mode != JoinMode::MANY_TO_MANY {
-                *gadgets = Gadgets::HasOne;
-            }
+            // The proof-supported mode must retain the children allocated at construction.
+            debug_assert!(matches!(&*gadgets, Gadgets::ManyToMany(_)));
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_supported_join;
+    use super::{GadgetNode, JoinMode, ensure_supported_join};
+    use crate::irs::nodes::IsNode;
+    use ark_piop::DefaultSnarkBackend;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion_expr::{
         Expr, Join, JoinType, LogicalPlan, LogicalPlanBuilder,
@@ -1664,5 +1668,17 @@ mod tests {
             ensure_supported_join(&inner_join(true)).is_err(),
             "nullable keys must fail closed until validity bits are constrained"
         );
+    }
+
+    #[test]
+    fn unsupported_has_one_modes_keep_the_complete_join_protocol() {
+        let gadget =
+            GadgetNode::<DefaultSnarkBackend>::new(inner_join(false), JoinMode::ONE_TO_MANY);
+        assert_eq!(gadget.join_mode(), JoinMode::MANY_TO_MANY);
+        assert_eq!(gadget.children().len(), 3);
+
+        gadget.set_join_mode(JoinMode::MANY_TO_ONE);
+        assert_eq!(gadget.join_mode(), JoinMode::MANY_TO_MANY);
+        assert_eq!(gadget.children().len(), 3);
     }
 }

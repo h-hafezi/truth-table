@@ -1,4 +1,4 @@
-//! End-to-end regression for MatchPair's additional Boolean/count claims.
+//! Production-path regression for MatchPair's supported input boundary.
 
 use std::{fs::File, path::Path, sync::Arc};
 
@@ -9,7 +9,7 @@ use datafusion::arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
-use datafusion::parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
+use datafusion::parquet::arrow::ArrowWriter;
 use tt_exec::{
     commit::CommitBuilder, prove::ProveBuilder, setup::SetupBuilder, verify::VerifyBuilder,
 };
@@ -45,26 +45,17 @@ fn active_table(
     )?)
 }
 
-fn parquet_row_count(path: &Path) -> Result<usize> {
-    let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?.build()?;
-    Ok(reader
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .iter()
-        .map(RecordBatch::num_rows)
-        .sum())
-}
-
-#[tokio::test]
-async fn honest_duplicate_key_join_still_proves_and_verifies() -> Result<()> {
+async fn run_nullable_parquet_join() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let left_path = dir.path().join("match_left.parquet");
     let right_path = dir.path().join("match_right.parquet");
     let pk_path = dir.path().join("match.pk");
     let vk_path = dir.path().join("match.vk");
 
-    // Key 1 occurs twice on the left and once on the right, so the honest join
-    // has two output pairs.  This exercises multiplicities as well as the new
-    // union-activator BoolCheck and shared output-count Sumcheck target.
+    // The values themselves contain no NULLs. Nevertheless, DataFusion marks
+    // Parquet scan fields nullable, and schema nullability alone cannot prove
+    // that validity bits are absent. The production path must therefore reject
+    // before attempting the otherwise two-row join.
     write_batch(
         &left_path,
         &active_table("l_key", "l_value", vec![1, 1, 2], vec![10, 11, 20])?,
@@ -106,7 +97,6 @@ async fn honest_duplicate_key_join_still_proves_and_verifies() -> Result<()> {
         .build()?
         .run()
         .await?;
-    assert_eq!(parquet_row_count(&output.result_path)?, 2);
 
     VerifyBuilder::new()
         .with_query(query.to_owned())
@@ -116,5 +106,12 @@ async fn honest_duplicate_key_join_still_proves_and_verifies() -> Result<()> {
         .with_vk_path(vk_path)
         .build()?
         .run()
-        .await
+        .await?;
+    panic!("nullable join unexpectedly verified")
+}
+
+#[tokio::test]
+#[should_panic(expected = "NULL validity is not encoded")]
+async fn nullable_parquet_join_fails_closed_until_validity_is_authenticated() {
+    run_nullable_parquet_join().await.unwrap();
 }
