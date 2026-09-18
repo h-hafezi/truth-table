@@ -38,6 +38,11 @@ pub struct TrackingPass<B: SnarkBackend> {
     verifier: RefCell<ArgVerifier<B>>,
     ctx_oracles: CtxOracles<B>,
     output_memtable: Option<Arc<MemTable>>,
+    /// Schema validation happens inside `LocalPass::transform`, whose API
+    /// cannot return a `Result`. Retain the first error and surface it from
+    /// `finish` before cryptographic verification instead of panicking or
+    /// accepting an unsupported field representation.
+    encoding_error: RefCell<Option<String>>,
     /// Columns some white-box string gadget consumes char-level side polys
     /// for (from `Tree::required_side_columns`). The prover emits side
     /// commitments only for these columns, so the verifier must expect
@@ -56,6 +61,7 @@ impl<B: SnarkBackend> TrackingPass<B> {
             verifier: RefCell::new(verifier),
             ctx_oracles,
             output_memtable,
+            encoding_error: RefCell::new(None),
             side_columns,
         }
     }
@@ -64,12 +70,24 @@ impl<B: SnarkBackend> TrackingPass<B> {
         &self,
         tracked_ir: &mut crate::verifier::irs::TrackedIr<B>,
     ) -> TTResult<()> {
+        if let Some(error) = self.encoding_error.borrow().as_ref() {
+            return Err(DataFusionError::Plan(error.clone()).into());
+        }
         let Some(output_memtable) = self.output_memtable.clone() else {
             return Ok(());
         };
         let root = tracked_ir.tree().root();
         if root.name() != "ResultCheck" {
             return Ok(());
+        }
+        for field in output_memtable.schema().fields() {
+            arithmetic::encoding::validate_fixed_width_encoding_safety::<B::F>(field.data_type())
+                .map_err(|error| {
+                DataFusionError::Plan(format!(
+                    "unsupported verifier output encoding for field `{}`: {error}",
+                    field.name()
+                ))
+            })?;
         }
 
         let materialized = Self::materialized_table_from_memtable(output_memtable, None).await?;
@@ -113,8 +131,26 @@ where
         _id: NodeId,
         payload: Option<&HintDFPayload>,
     ) -> Option<TrackedPayload<B>> {
+        if self.encoding_error.borrow().is_some() {
+            return None;
+        }
         // If there is no payload, do nothing
         let payload = payload?;
+        let validation_result = match payload {
+            HintDFPayload::PlanPayload(hint_df) => validate_hint_df_encoding::<B>(hint_df),
+            HintDFPayload::GadgetPayload(map) => map.iter().try_for_each(|(key, hint_df)| {
+                validate_hint_df_encoding::<B>(hint_df).map_err(|error| {
+                    format!("gadget payload `{key}` has an unsupported encoding: {error}")
+                })
+            }),
+        };
+        if let Err(error) = validation_result {
+            *self.encoding_error.borrow_mut() = Some(format!(
+                "verifier tracking rejected unsupported schema at node `{}`: {error}",
+                node.name()
+            ));
+            return None;
+        }
         match payload {
             // If the payload is a plan,
             HintDFPayload::PlanPayload(hint_df) => {
@@ -164,6 +200,20 @@ where
     fn name(&self) -> &'static str {
         "Verifier Tracking"
     }
+}
+
+fn validate_hint_df_encoding<B: SnarkBackend>(
+    hint_df: &crate::irs::nodes::hints::HintDF,
+) -> Result<(), String> {
+    hint_df
+        .data_frame()
+        .schema()
+        .fields()
+        .iter()
+        .try_for_each(|field| {
+            arithmetic::encoding::validate_fixed_width_encoding_safety::<B::F>(field.data_type())
+                .map_err(|error| format!("field `{}`: {error}", field.name()))
+        })
 }
 
 fn track_hint_df_from_oracle<B: SnarkBackend>(
@@ -362,6 +412,11 @@ fn track_hint_df<B: SnarkBackend>(
 /// `[col, col__length]`). The first segment uses the unchanged field; later
 /// segments inherit `metadata` and nullability but rename to `<col>{suffix}`.
 fn segment_fields<B: SnarkBackend>(field: &FieldRef) -> Vec<FieldRef> {
+    // `TrackingPass::transform` validates every HintDF schema before reaching
+    // this helper. Keep this assertion as defense in depth for future callers
+    // that might enumerate verifier commitments without that preflight.
+    arithmetic::encoding::validate_fixed_width_encoding_safety::<B::F>(field.data_type())
+        .expect("segment enumeration requires a safe fixed-width field encoding");
     let suffixes = arithmetic::encoding::segment_suffixes_for_type::<B::F>(field.data_type());
     if suffixes.len() <= 1 {
         return vec![field.clone()];
@@ -558,4 +613,40 @@ fn eval_mle_at_point<F: Field + Copy>(evaluations: &[F], num_vars: usize, point:
         layer = next;
     }
     layer[0]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_hint_df_encoding;
+    use crate::irs::nodes::hints::{HintDF, schema_only_df};
+    use ark_piop::DefaultSnarkBackend;
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use std::sync::Arc;
+
+    #[test]
+    fn verifier_hint_schema_rejects_decimal256_including_nested() {
+        let direct = HintDF::new_virtual(schema_only_df(vec![Field::new(
+            "amount",
+            DataType::Decimal256(76, 0),
+            false,
+        )]));
+        let direct_error = validate_hint_df_encoding::<DefaultSnarkBackend>(&direct)
+            .expect_err("Decimal256 must be rejected before verifier tracking");
+        assert!(direct_error.contains("amount"));
+        assert!(direct_error.contains("Decimal256"));
+
+        let nested = HintDF::new_virtual(schema_only_df(vec![Field::new(
+            "amounts",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Decimal256(76, 0),
+                false,
+            ))),
+            false,
+        )]));
+        let nested_error = validate_hint_df_encoding::<DefaultSnarkBackend>(&nested)
+            .expect_err("nested Decimal256 must be rejected before verifier tracking");
+        assert!(nested_error.contains("amounts"));
+        assert!(nested_error.contains("Decimal256"));
+    }
 }
