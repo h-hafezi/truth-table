@@ -276,16 +276,14 @@ fn prove_result_check<B: SnarkBackend>(
         Some(_) => return Err(false_claim()),
         None => true,
     };
-    if !needs_boolean_check {
-        if let Some(fingerprint) = folded_t.as_constant() {
-            add_sumcheck_compatibility_anchor_prover(prover)?;
-            let expected = constant_active_result_sum::<B>(fingerprint, gamma, t_table.log_size())?;
-            return if target == expected {
-                Ok(())
-            } else {
-                Err(false_claim())
-            };
-        }
+    if !needs_boolean_check && let Some(fingerprint) = folded_t.as_constant() {
+        add_sumcheck_compatibility_anchor_prover(prover)?;
+        let expected = constant_active_result_sum::<B>(fingerprint, gamma, t_table.log_size())?;
+        return if target == expected {
+            Ok(())
+        } else {
+            Err(false_claim())
+        };
     }
     let denominator = folded_t - gamma;
     let mut inverses = denominator.evaluations();
@@ -369,18 +367,16 @@ fn verify_result_check<B: SnarkBackend>(
         Some(_) => return Err(result_error("internal activator is not Boolean")),
         None => true,
     };
-    if !needs_boolean_check {
-        if let Some(fingerprint) = folded_t.as_constant() {
-            add_sumcheck_compatibility_anchor_verifier(verifier)?;
-            let expected = constant_active_result_sum::<B>(fingerprint, gamma, t_table.log_size())?;
-            return if target == expected {
-                Ok(())
-            } else {
-                Err(result_error(
-                    "constant internal result does not match the public result",
-                ))
-            };
-        }
+    if !needs_boolean_check && let Some(fingerprint) = folded_t.as_constant() {
+        add_sumcheck_compatibility_anchor_verifier(verifier)?;
+        let expected = constant_active_result_sum::<B>(fingerprint, gamma, t_table.log_size())?;
+        return if target == expected {
+            Ok(())
+        } else {
+            Err(result_error(
+                "constant internal result does not match the public result",
+            ))
+        };
     }
     let denominator = folded_t - gamma;
     let inverse = verifier.track_next_mv_com()?;
