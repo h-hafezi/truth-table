@@ -142,6 +142,12 @@ pub fn apply_optimization_hints(
         }
     }
 
+    // Hints are prover-supplied, so validate rematerialization against the
+    // original public plan before applying any bag-only rewrite.
+    if !remat_paths.is_empty() {
+        rematerialize::ensure_rematerialization_is_order_safe(&plan)?;
+    }
+
     if remat_paths.is_empty() {
         return Ok(plan);
     }
