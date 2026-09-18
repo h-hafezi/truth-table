@@ -109,7 +109,10 @@ async fn fixed_proof_rejects_reordered_and_changed_public_rows() -> Result<()> {
         .run()
         .await?;
 
-    let query = "SELECT value FROM audit_input ORDER BY value ASC";
+    // Keep this boundary regression in Bag mode so nullable/NULL rejection is
+    // covered independently. Ordered fresh-proof attacks are exercised by the
+    // core ResultCheck tests and by the non-null ORDER BY integration stack.
+    let query = "SELECT value FROM audit_input";
     let output = ProveBuilder::new()
         .with_query(query.to_owned())
         .with_parquet_path(input_path.clone())
@@ -128,7 +131,7 @@ async fn fixed_proof_rejects_reordered_and_changed_public_rows() -> Result<()> {
         .as_any()
         .downcast_ref::<Int64Array>()
         .context("expected Int64 query output")?;
-    assert_eq!(values.values().as_ref(), &[0, 1, 2, 4]);
+    assert_eq!(values.values().as_ref(), &[4, 1, 0, 2]);
     verify_result(
         query,
         &oracle_path,
@@ -167,7 +170,7 @@ async fn fixed_proof_rejects_reordered_and_changed_public_rows() -> Result<()> {
     // Preserve order, row count, field type, and schema; change one actual value.
     let changed = RecordBatch::try_new(
         honest.schema(),
-        vec![Arc::new(Int64Array::from(vec![Some(0), Some(1), Some(2), Some(5)])) as ArrayRef],
+        vec![Arc::new(Int64Array::from(vec![Some(4), Some(1), Some(0), Some(5)])) as ArrayRef],
     )?;
     let changed_path = dir.path().join("changed.parquet");
     write_batch(&changed_path, &changed)?;
@@ -187,7 +190,7 @@ async fn fixed_proof_rejects_reordered_and_changed_public_rows() -> Result<()> {
     // included in the authenticated relation.
     let null_substitution = RecordBatch::try_new(
         honest.schema(),
-        vec![Arc::new(Int64Array::from(vec![None, Some(1), Some(2), Some(4)])) as ArrayRef],
+        vec![Arc::new(Int64Array::from(vec![Some(4), Some(1), None, Some(2)])) as ArrayRef],
     )?;
     let null_path = dir.path().join("null-substitution.parquet");
     write_batch(&null_path, &null_substitution)?;
@@ -211,7 +214,7 @@ async fn fixed_proof_rejects_reordered_and_changed_public_rows() -> Result<()> {
     )]));
     let wrong_type = RecordBatch::try_new(
         wrong_type_schema,
-        vec![Arc::new(UInt64Array::from(vec![0, 1, 2, 4])) as ArrayRef],
+        vec![Arc::new(UInt64Array::from(vec![4, 1, 0, 2])) as ArrayRef],
     )?;
     let wrong_type_path = dir.path().join("wrong-type.parquet");
     write_batch(&wrong_type_path, &wrong_type)?;
@@ -293,8 +296,7 @@ async fn fixed_proof_rejects_reordered_and_changed_public_rows() -> Result<()> {
     // nested ResultCheck, which would otherwise fail for lack of a second
     // public payload during production verification.
     let subquery = "SELECT value FROM audit_input \
-        WHERE value IN (SELECT value FROM audit_input WHERE value <= 1) \
-        ORDER BY value ASC";
+        WHERE value IN (SELECT value FROM audit_input WHERE value <= 1)";
     let subquery_output = ProveBuilder::new()
         .with_query(subquery.to_owned())
         .with_parquet_path(input_path)

@@ -1,3 +1,4 @@
+use crate::irs::nodes::utils::result_check::ResultCheckMode;
 use crate::irs::nodes::{
     IsLpNode, IsNode, IsPlanNode, Node, PlanNode, ProverNodeOps, VerifierNodeOps,
 };
@@ -24,6 +25,7 @@ where
 {
     input: Arc<Node<B>>,
     gadget: Arc<Node<B>>,
+    mode: ResultCheckMode,
 }
 
 impl<B: SnarkBackend> IsNode<B> for LpNode<B> {
@@ -32,7 +34,11 @@ impl<B: SnarkBackend> IsNode<B> for LpNode<B> {
     }
 
     fn display(&self) -> String {
-        format!("ResultCheck\nInput: {}", self.input.name())
+        format!(
+            "ResultCheck ({:?})\nInput: {}",
+            self.mode,
+            self.input.name()
+        )
     }
 
     fn cost(
@@ -150,7 +156,7 @@ impl<B: SnarkBackend> IsLpNode<B> for LpNode<B> {
         let input = crate::irs::tree::Tree::<B>::from_logical_plan(result_check.input())
             .root()
             .clone();
-        Self::new(input)
+        Self::new_with_mode(input, result_check.mode())
     }
 
     fn lp(&self) -> LogicalPlan {
@@ -158,7 +164,7 @@ impl<B: SnarkBackend> IsLpNode<B> for LpNode<B> {
             Node::Plan(PlanNode::LpBased(node)) => node.lp(),
             _ => panic!("ResultCheck input must be an LP node"),
         };
-        wrap_logical_plan(input_lp)
+        wrap_logical_plan_with_mode(input_lp, self.mode)
     }
 }
 
@@ -216,11 +222,24 @@ impl<B: SnarkBackend> VerifierNodeOps<B> for LpNode<B> {
 }
 
 impl<B: SnarkBackend> LpNode<B> {
+    /// Construct the legacy bag-equality ResultCheck.
     pub fn new(input: Arc<Node<B>>) -> Self {
+        Self::new_with_mode(input, ResultCheckMode::Bag)
+    }
+
+    pub fn new_with_mode(input: Arc<Node<B>>, mode: ResultCheckMode) -> Self {
         let gadget = Arc::new(Node::Gadget(Arc::new(
-            crate::irs::nodes::utils::result_check::GadgetNode::<B>::new(),
+            crate::irs::nodes::utils::result_check::GadgetNode::<B>::new(mode),
         )));
-        Self { input, gadget }
+        Self {
+            input,
+            gadget,
+            mode,
+        }
+    }
+
+    pub fn mode(&self) -> ResultCheckMode {
+        self.mode
     }
 }
 
@@ -379,8 +398,8 @@ fn validate_result_schema<B: SnarkBackend>(
         };
         if !type_and_nullability_match {
             return Err(result_schema_error(&format!(
-                "public result column {} has the wrong type or nullability",
-                public_field.name()
+                "public result column {} has the wrong type or nullability: internal={input_field:?}, public={public_field:?}",
+                public_field.name(),
             )));
         }
     }
@@ -460,14 +479,21 @@ fn result_schema_error(message: &str) -> ark_piop::errors::SnarkError {
 pub struct ResultCheckLogicalNode {
     input: Arc<LogicalPlan>,
     schema: DFSchemaRef,
+    mode: ResultCheckMode,
 }
 
 impl ResultCheckLogicalNode {
+    /// Construct the legacy bag-equality ResultCheck.
     pub fn new(input: LogicalPlan) -> Self {
+        Self::new_with_mode(input, ResultCheckMode::Bag)
+    }
+
+    pub fn new_with_mode(input: LogicalPlan, mode: ResultCheckMode) -> Self {
         let schema = input.schema().clone();
         Self {
             input: Arc::new(input),
             schema,
+            mode,
         }
     }
 
@@ -475,8 +501,12 @@ impl ResultCheckLogicalNode {
         self.input.as_ref()
     }
 
+    pub fn mode(&self) -> ResultCheckMode {
+        self.mode
+    }
+
     fn key(&self) -> String {
-        format!("{:?}", self.input)
+        format!("{:?}:{:?}", self.mode, self.input)
     }
 }
 
@@ -535,7 +565,7 @@ impl UserDefinedLogicalNode for ResultCheckLogicalNode {
     }
 
     fn fmt_for_explain(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "ResultCheck")
+        write!(f, "ResultCheck: mode={:?}", self.mode)
     }
 
     fn with_exprs_and_inputs(
@@ -553,8 +583,9 @@ impl UserDefinedLogicalNode for ResultCheckLogicalNode {
                 "ResultCheck expects a single input".to_string(),
             ));
         }
-        Ok(Arc::new(ResultCheckLogicalNode::new(
+        Ok(Arc::new(ResultCheckLogicalNode::new_with_mode(
             inputs.into_iter().next().unwrap(),
+            self.mode,
         )))
     }
 
@@ -578,8 +609,12 @@ impl UserDefinedLogicalNode for ResultCheckLogicalNode {
 }
 
 pub fn wrap_logical_plan(input: LogicalPlan) -> LogicalPlan {
+    wrap_logical_plan_with_mode(input, ResultCheckMode::Bag)
+}
+
+pub fn wrap_logical_plan_with_mode(input: LogicalPlan, mode: ResultCheckMode) -> LogicalPlan {
     LogicalPlan::Extension(Extension {
-        node: Arc::new(ResultCheckLogicalNode::new(input)),
+        node: Arc::new(ResultCheckLogicalNode::new_with_mode(input, mode)),
     })
 }
 
@@ -591,11 +626,54 @@ fn _result_check_key(plan: &LogicalPlan) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_public_result_encoding, validate_result_schema};
+    use super::{
+        ResultCheckLogicalNode, validate_public_result_encoding, validate_result_schema,
+        wrap_logical_plan_with_mode,
+    };
+    use crate::irs::nodes::utils::result_check::ResultCheckMode;
     use arithmetic::ACTIVATOR_COL_NAME;
     use ark_piop::DefaultSnarkBackend;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_expr::{UserDefinedLogicalNode, logical_plan::builder::table_scan};
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
     use std::sync::Arc;
+
+    #[test]
+    fn logical_node_retains_mode_across_rewrites_and_identity() {
+        let input = table_scan(
+            Some("input"),
+            &Schema::new(vec![Field::new("value", DataType::Int64, false)]),
+            None,
+        )
+        .expect("table scan should be valid")
+        .build()
+        .expect("logical plan should be valid");
+        let bag = ResultCheckLogicalNode::new(input.clone());
+        let ordered =
+            ResultCheckLogicalNode::new_with_mode(input.clone(), ResultCheckMode::Ordered);
+
+        assert!(!bag.dyn_eq(&ordered));
+        let mut bag_hash = DefaultHasher::new();
+        bag.dyn_hash(&mut bag_hash);
+        let mut ordered_hash = DefaultHasher::new();
+        ordered.dyn_hash(&mut ordered_hash);
+        assert_ne!(bag_hash.finish(), ordered_hash.finish());
+
+        let rewritten = ordered
+            .with_exprs_and_inputs(Vec::new(), vec![input.clone()])
+            .expect("identity rewrite should succeed");
+        let rewritten = rewritten
+            .as_any()
+            .downcast_ref::<ResultCheckLogicalNode>()
+            .expect("rewrite should remain ResultCheck");
+        assert_eq!(rewritten.mode(), ResultCheckMode::Ordered);
+
+        let display = wrap_logical_plan_with_mode(input, ResultCheckMode::Ordered)
+            .display_indent()
+            .to_string();
+        assert!(display.contains("ResultCheck: mode=Ordered"));
+    }
 
     #[test]
     fn low_level_result_schema_rejects_an_omitted_column() {

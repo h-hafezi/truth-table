@@ -1,16 +1,14 @@
 //! ResultCheck binds committed internal rows to a verifier-owned public table.
-//! These tests exercise bag equality, not ordered result equality. Public R
-//! uses evaluable local oracles rather than another proof-owned commitment.
-//! A proof is nevertheless bound to one exact arithmetized public encoding:
-//! reordering the statement requires a fresh proof even though that fresh proof
-//! is valid. The production boundary rejects public NULLs because validity
-//! columns are not yet part of that encoding. These are field-encoding tests;
-//! general SQL-value equality additionally requires a NULL-free internal query
-//! pipeline until internal validity columns are authenticated.
+//! Bag mode proves multiset equality. Ordered mode additionally fingerprints
+//! each physical rank and requires a compact public activator, thereby proving
+//! equality of the active row sequence. Public R uses evaluable local oracles
+//! rather than another proof-owned commitment. Ordered mode rejects nullable
+//! schemas until validity columns become part of the authenticated encoding.
 
 use std::sync::Arc;
 
 use arithmetic::{ACTIVATOR_FIELD, table::TrackedTable, table_oracle::TrackedTableOracle};
+use ark_ff::PrimeField;
 use ark_piop::{
     DefaultSnarkBackend, SnarkBackend,
     arithmetic::mat_poly::mle::MLE,
@@ -29,8 +27,9 @@ use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use indexmap::IndexMap;
 
 use super::{
-    RESULT_CHECK_MAX_CHALLENGE_FIELD_BITS, RESULT_CHECK_SECURITY_BITS,
-    has_result_check_security_margin, prove_result_check, public_evaluations, verify_result_check,
+    RESULT_CHECK_MAX_CHALLENGE_FIELD_BITS, RESULT_CHECK_SECURITY_BITS, ResultCheckMode,
+    has_injective_ordered_index_encoding, has_result_check_security_margin, prove_result_check,
+    public_evaluations, verify_result_check,
 };
 
 type B = DefaultSnarkBackend;
@@ -63,10 +62,22 @@ fn security_margin_boundary_is_strict_and_checked() {
     ));
 }
 
+#[test]
+fn ordered_index_encoding_checks_integer_and_field_boundaries() {
+    assert!(has_injective_ordered_index_encoding::<F>(0, 0));
+    assert!(has_injective_ordered_index_encoding::<F>(31, 63));
+    assert!(!has_injective_ordered_index_encoding::<F>(0, 64));
+    assert!(!has_injective_ordered_index_encoding::<F>(
+        0,
+        F::MODULUS_BIT_SIZE as usize
+    ));
+}
+
 #[derive(Clone)]
 struct Table {
     data: Vec<Vec<u64>>,
     active: Vec<u64>,
+    nullable_data: bool,
 }
 
 impl Table {
@@ -76,7 +87,13 @@ impl Table {
         Self {
             data: data.iter().map(|column| column.to_vec()).collect(),
             active: active.to_vec(),
+            nullable_data: false,
         }
+    }
+
+    fn with_nullable_data(mut self) -> Self {
+        self.nullable_data = true;
+        self
     }
 
     fn nv(&self) -> usize {
@@ -93,7 +110,7 @@ impl Table {
                     Arc::new(Field::new(
                         format!("column_{index}"),
                         DataType::UInt64,
-                        false,
+                        self.nullable_data,
                     )),
                     self.polynomial(values),
                 )
@@ -114,6 +131,7 @@ struct Fixture {
     input: Table,
     input_ids: Vec<TrackerID>,
     public_ids: Vec<TrackerID>,
+    mode: ResultCheckMode,
 }
 
 fn prover_table(
@@ -138,12 +156,16 @@ fn prover_table(
 
 impl Fixture {
     fn prove(input: &Table, public: &Table) -> SnarkResult<Self> {
+        Self::prove_with_mode(input, public, ResultCheckMode::Bag)
+    }
+
+    fn prove_with_mode(input: &Table, public: &Table, mode: ResultCheckMode) -> SnarkResult<Self> {
         let (mut prover, verifier) = prelude_with_vars::<B>(6)?;
         let (t_table, input_ids) = prover_table(&mut prover, input, false)?;
         let (r_table, public_ids) = prover_table(&mut prover, public, true)?;
         // Deliberately do not invoke ResultCheck::honest_prover_check: these
         // regressions must exercise the actual proof/verifier obligations.
-        prove_result_check(&mut prover, &t_table, &r_table)?;
+        prove_result_check(&mut prover, &t_table, &r_table, mode)?;
         let proof = prover.build_proof()?;
         Ok(Self {
             proof,
@@ -151,6 +173,7 @@ impl Fixture {
             input: input.clone(),
             input_ids,
             public_ids,
+            mode,
         })
     }
 
@@ -201,10 +224,33 @@ impl Fixture {
     }
 
     fn verify(&self, public: &Table) -> SnarkResult<()> {
+        self.verify_with_mode(public, self.mode)
+    }
+
+    fn verify_with_mode(&self, public: &Table, mode: ResultCheckMode) -> SnarkResult<()> {
         let (mut verifier, t_table, r_table) = self.prepare_verifier(public)?;
-        verify_result_check(&mut verifier, &t_table, &r_table)?;
+        verify_result_check(&mut verifier, &t_table, &r_table, mode)?;
         verifier.verify()
     }
+}
+
+fn assert_fresh_proof_rejected(
+    input: &Table,
+    public: &Table,
+    mode: ResultCheckMode,
+) -> SnarkResult<()> {
+    match Fixture::prove_with_mode(input, public, mode) {
+        Err(error) => {
+            assert!(matches!(
+                error,
+                SnarkError::ProverError(ProverError::HonestProverError(
+                    HonestProverError::FalseClaim
+                )) | SnarkError::VerifierError(_)
+            ));
+        }
+        Ok(fixture) => assert!(fixture.verify(public).is_err()),
+    }
+    Ok(())
 }
 
 #[test]
@@ -387,9 +433,109 @@ fn false_public_statement_is_not_certified_by_internal_rows() -> SnarkResult<()>
             let (mut verifier, t_table, r_table) = fixture.prepare_verifier(&false_public)?;
             // Unlike the same-proof mutation tests, the public digest matches:
             // only the algebraic multiset relation should reject this proof.
-            verify_result_check(&mut verifier, &t_table, &r_table)?;
+            verify_result_check(&mut verifier, &t_table, &r_table, ResultCheckMode::Bag)?;
             assert!(verifier.verify().is_err());
         }
     }
     Ok(())
+}
+
+#[test]
+fn fresh_reordered_proof_fails_ordered_but_passes_bag() -> SnarkResult<()> {
+    let input = Table::new(&[&[1, 2, 1, 3], &[10, 20, 10, 30]], &[1, 1, 1, 1]);
+    let reordered = Table::new(&[&[3, 1, 2, 1], &[30, 10, 20, 10]], &[1, 1, 1, 1]);
+
+    Fixture::prove_with_mode(&input, &reordered, ResultCheckMode::Bag)?.verify(&reordered)?;
+    assert_fresh_proof_rejected(&input, &reordered, ResultCheckMode::Ordered)
+}
+
+#[test]
+fn ordered_result_supports_different_capacities() -> SnarkResult<()> {
+    let input = Table::new(
+        &[&[11, 22, 33, 44, 901, 902, 903, 904]],
+        &[1, 1, 1, 1, 0, 0, 0, 0],
+    );
+    let public = Table::new(&[&[11, 22, 33, 44]], &[1, 1, 1, 1]);
+    Fixture::prove_with_mode(&input, &public, ResultCheckMode::Ordered)?.verify(&public)
+}
+
+#[test]
+fn ordered_result_rejects_sparse_internal_activation_algebraically() -> SnarkResult<()> {
+    let sparse = Table::new(&[&[11, 999, 22, 888]], &[1, 0, 1, 0]);
+    let public = Table::new(&[&[11, 22]], &[1, 1]);
+
+    // The same sparse table is a valid bag representation. Ordered mode must
+    // reject it through the index-tagged proof relation, without relying on
+    // `honest_prover_check` (which this fixture deliberately never invokes).
+    Fixture::prove_with_mode(&sparse, &public, ResultCheckMode::Bag)?.verify(&public)?;
+    assert_fresh_proof_rejected(&sparse, &public, ResultCheckMode::Ordered)
+}
+
+#[test]
+fn ordered_result_rejects_non_prefix_public_activation() -> SnarkResult<()> {
+    let input = Table::new(&[&[11, 22, 33, 44]], &[1, 1, 0, 0]);
+    let sparse_public = Table::new(&[&[11, 999, 22, 888]], &[1, 0, 1, 0]);
+    assert_fresh_proof_rejected(&input, &sparse_public, ResultCheckMode::Ordered)
+}
+
+#[test]
+fn ordered_empty_results_ignore_inactive_padding() -> SnarkResult<()> {
+    let input = Table::new(&[&[91, 92, 93, 94]], &[0, 0, 0, 0]);
+    let public = Table::new(&[&[81, 82]], &[0, 0]);
+    Fixture::prove_with_mode(&input, &public, ResultCheckMode::Ordered)?.verify(&public)
+}
+
+#[test]
+fn ordered_single_row_result_supports_log_size_zero() -> SnarkResult<()> {
+    let input = Table::new(&[&[7, 91, 92, 93]], &[1, 0, 0, 0]);
+    let public = Table::new(&[&[7]], &[1]);
+    Fixture::prove_with_mode(&input, &public, ResultCheckMode::Ordered)?.verify(&public)
+}
+
+#[test]
+fn ordered_duplicate_rows_are_supported_but_other_rows_cannot_cross_them() -> SnarkResult<()> {
+    let input = Table::new(&[&[7, 7, 8, 99]], &[1, 1, 1, 0]);
+    let public = Table::new(&[&[7, 7, 8, 0]], &[1, 1, 1, 0]);
+    Fixture::prove_with_mode(&input, &public, ResultCheckMode::Ordered)?.verify(&public)?;
+
+    let reordered = Table::new(&[&[7, 8, 7, 0]], &[1, 1, 1, 0]);
+    assert_fresh_proof_rejected(&input, &reordered, ResultCheckMode::Ordered)
+}
+
+#[test]
+fn result_check_modes_are_transcript_domain_separated() -> SnarkResult<()> {
+    let table = Table::new(&[&[1, 2, 3, 4]], &[1, 1, 1, 1]);
+    let bag = Fixture::prove_with_mode(&table, &table, ResultCheckMode::Bag)?;
+    bag.verify(&table)?;
+    assert!(
+        bag.verify_with_mode(&table, ResultCheckMode::Ordered)
+            .is_err()
+    );
+    let ordered = Fixture::prove_with_mode(&table, &table, ResultCheckMode::Ordered)?;
+    ordered.verify(&table)?;
+    assert!(
+        ordered
+            .verify_with_mode(&table, ResultCheckMode::Bag)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn fresh_ordered_proof_rejects_a_changed_value_at_the_same_rank() -> SnarkResult<()> {
+    let input = Table::new(&[&[1, 2, 3, 4]], &[1, 1, 1, 1]);
+    let changed = Table::new(&[&[1, 2, 99, 4]], &[1, 1, 1, 1]);
+    assert_fresh_proof_rejected(&input, &changed, ResultCheckMode::Ordered)?;
+    Ok(())
+}
+
+#[test]
+fn ordered_result_rejects_unauthenticated_nullable_columns() -> SnarkResult<()> {
+    let input = Table::new(&[&[1, 2]], &[1, 1]).with_nullable_data();
+    let public = Table::new(&[&[1, 2]], &[1, 1]).with_nullable_data();
+
+    // Bag mode retains its legacy field-encoding contract. Ordered mode fails
+    // closed until validity bits are authenticated as part of each row.
+    Fixture::prove_with_mode(&input, &public, ResultCheckMode::Bag)?.verify(&public)?;
+    assert_fresh_proof_rejected(&input, &public, ResultCheckMode::Ordered)
 }
