@@ -121,10 +121,184 @@ fn match_pair_check_error(message: &str) -> ark_piop::errors::SnarkError {
     )
 }
 
+/// Enforce equality of every row-domain encoding segment for each output key.
+///
+/// The relation is gated by the committed output activator, so inactive
+/// padding remains unconstrained. We register one exact Zerocheck per segment:
+/// for every active output row `i`, key position `j`, and encoding segment
+/// `s`, the verifier checks
+///
+/// `a_out(i) * (left_key[j][s](i) - right_key[j][s](i)) = 0`.
+///
+/// All operands come from the already committed join-output table; there is no
+/// prover-supplied equality witness.
+fn add_output_key_equality_claims_prover<B: SnarkBackend>(
+    prover: &mut ark_piop::prover::ArgProver<B>,
+    output_activator: &TrackedPoly<B>,
+    output_log_size: usize,
+    left_keys: &arithmetic::table::TrackedTable<B>,
+    right_keys: &arithmetic::table::TrackedTable<B>,
+) -> ark_piop::errors::SnarkResult<()> {
+    if left_keys.log_size() != output_log_size || right_keys.log_size() != output_log_size {
+        return Err(match_pair_check_error(
+            "output left/right key tables must share the declared output row domain",
+        ));
+    }
+    if !output_activator.is_constant() && output_activator.log_size() != output_log_size {
+        return Err(match_pair_check_error(
+            "output activator and output key tables must share one row domain",
+        ));
+    }
+
+    let left_cols = left_keys
+        .tracked_cols_iter()
+        .filter(|(field, _)| !arithmetic::is_system_column(field.name()))
+        .collect::<Vec<_>>();
+    let right_cols = right_keys
+        .tracked_cols_iter()
+        .filter(|(field, _)| !arithmetic::is_system_column(field.name()))
+        .collect::<Vec<_>>();
+    if left_cols.is_empty() || left_cols.len() != right_cols.len() {
+        return Err(match_pair_check_error(
+            "output left/right key tables must contain the same nonzero number of keys",
+        ));
+    }
+
+    for (key_index, ((left_field, left_col), (right_field, right_col))) in
+        left_cols.into_iter().zip(right_cols).enumerate()
+    {
+        if left_field.data_type() != right_field.data_type() {
+            return Err(match_pair_check_error(&format!(
+                "output key {key_index} has different left/right encoding types"
+            )));
+        }
+        let left_segments = left_col.segments_iter().collect::<Vec<_>>();
+        let right_segments = right_col.segments_iter().collect::<Vec<_>>();
+        if left_segments.len() != right_segments.len() {
+            return Err(match_pair_check_error(&format!(
+                "output key {key_index} has different left/right encoding widths"
+            )));
+        }
+
+        for (segment_index, (left_segment, right_segment)) in
+            left_segments.into_iter().zip(right_segments).enumerate()
+        {
+            let (left_suffix, left_poly, _) = left_segment;
+            let (right_suffix, right_poly, _) = right_segment;
+            if left_suffix != right_suffix {
+                return Err(match_pair_check_error(&format!(
+                    "output key {key_index} segment {segment_index} has incompatible left/right encodings"
+                )));
+            }
+            if (!left_poly.is_constant() && left_poly.log_size() != output_log_size)
+                || (!right_poly.is_constant() && right_poly.log_size() != output_log_size)
+            {
+                return Err(match_pair_check_error(&format!(
+                    "output key {key_index} segment {segment_index} is on the wrong row domain"
+                )));
+            }
+            if !left_poly.same_tracker(right_poly) || !left_poly.same_tracker(output_activator) {
+                return Err(match_pair_check_error(
+                    "output key equality operands must share the proof tracker",
+                ));
+            }
+
+            let residual = &(left_poly - right_poly) * output_activator;
+            prover.add_mv_zerocheck_claim(residual.id())?;
+        }
+    }
+    Ok(())
+}
+
+/// Verifier-side mirror of [`add_output_key_equality_claims_prover`].
+fn add_output_key_equality_claims_verifier<B: SnarkBackend>(
+    verifier: &mut ark_piop::verifier::ArgVerifier<B>,
+    output_activator: &TrackedOracle<B>,
+    output_log_size: usize,
+    left_keys: &arithmetic::table_oracle::TrackedTableOracle<B>,
+    right_keys: &arithmetic::table_oracle::TrackedTableOracle<B>,
+) -> ark_piop::errors::SnarkResult<()> {
+    if left_keys.log_size() != output_log_size || right_keys.log_size() != output_log_size {
+        return Err(match_pair_check_error(
+            "output left/right key tables must share the declared output row domain",
+        ));
+    }
+    if !output_activator.is_constant() && output_activator.log_size() != output_log_size {
+        return Err(match_pair_check_error(
+            "output activator and output key tables must share one row domain",
+        ));
+    }
+
+    let left_cols = left_keys
+        .tracked_col_oracles_iter()
+        .filter(|(field, _)| !arithmetic::is_system_column(field.name()))
+        .collect::<Vec<_>>();
+    let right_cols = right_keys
+        .tracked_col_oracles_iter()
+        .filter(|(field, _)| !arithmetic::is_system_column(field.name()))
+        .collect::<Vec<_>>();
+    if left_cols.is_empty() || left_cols.len() != right_cols.len() {
+        return Err(match_pair_check_error(
+            "output left/right key tables must contain the same nonzero number of keys",
+        ));
+    }
+
+    for (key_index, ((left_field, left_col), (right_field, right_col))) in
+        left_cols.into_iter().zip(right_cols).enumerate()
+    {
+        if left_field.data_type() != right_field.data_type() {
+            return Err(match_pair_check_error(&format!(
+                "output key {key_index} has different left/right encoding types"
+            )));
+        }
+        let left_segments = left_col.segments_iter().collect::<Vec<_>>();
+        let right_segments = right_col.segments_iter().collect::<Vec<_>>();
+        if left_segments.len() != right_segments.len() {
+            return Err(match_pair_check_error(&format!(
+                "output key {key_index} has different left/right encoding widths"
+            )));
+        }
+
+        for (segment_index, (left_segment, right_segment)) in
+            left_segments.into_iter().zip(right_segments).enumerate()
+        {
+            let (left_suffix, left_oracle, _) = left_segment;
+            let (right_suffix, right_oracle, _) = right_segment;
+            if left_suffix != right_suffix {
+                return Err(match_pair_check_error(&format!(
+                    "output key {key_index} segment {segment_index} has incompatible left/right encodings"
+                )));
+            }
+            if (!left_oracle.is_constant() && left_oracle.log_size() != output_log_size)
+                || (!right_oracle.is_constant() && right_oracle.log_size() != output_log_size)
+            {
+                return Err(match_pair_check_error(&format!(
+                    "output key {key_index} segment {segment_index} is on the wrong row domain"
+                )));
+            }
+            if !left_oracle.same_tracker(right_oracle)
+                || !left_oracle.same_tracker(output_activator)
+            {
+                return Err(match_pair_check_error(
+                    "output key equality operands must share the proof tracker",
+                ));
+            }
+
+            let residual = &(left_oracle - right_oracle) * output_activator;
+            verifier.add_mv_zerocheck_claim(residual.id());
+        }
+    }
+    Ok(())
+}
+
 /// The left join keys (either a single key or a composite key)
 pub const LEFT_LABEL: &str = "__left__";
 /// The right join keys (either a single key or a composite key)
 pub const RIGHT_LABEL: &str = "__right__";
+/// The join-key columns contributed by the left input to each output row.
+pub const OUTPUT_LEFT_KEYS_LABEL: &str = "__output_left_keys__";
+/// The join-key columns contributed by the right input to each output row.
+pub const OUTPUT_RIGHT_KEYS_LABEL: &str = "__output_right_keys__";
 /// The output of the join gadget
 /// TODO: This is not in the paper, but we use it here to extract the number of matches; i.e. `s` in the paper's notation. We should remove it in the future
 pub const OUT_LABEL: &str = "__out__";
@@ -619,6 +793,12 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
         let Some(right_table) = payload.get(RIGHT_LABEL).cloned() else {
             panic!("Expected right table for Match-Pair gadget");
         };
+        let Some(output_left_keys) = payload.get(OUTPUT_LEFT_KEYS_LABEL).cloned() else {
+            panic!("Expected output-left key table for Match-Pair gadget");
+        };
+        let Some(output_right_keys) = payload.get(OUTPUT_RIGHT_KEYS_LABEL).cloned() else {
+            panic!("Expected output-right key table for Match-Pair gadget");
+        };
         ensure_match_count_no_wrap::<B::F>(
             left_table.log_size(),
             right_table.log_size(),
@@ -635,6 +815,13 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
         let output_activator = output_table
             .activator_tracked_poly()
             .expect("Match-Pair output table missing activator");
+        add_output_key_equality_claims_prover(
+            prover,
+            &output_activator,
+            output_table.log_size(),
+            &output_left_keys,
+            &output_right_keys,
+        )?;
         let left_mult = single_data_poly_from_table(&left_multiplicities, "left multiplicity");
         let right_mult = single_data_poly_from_table(&right_multiplicities, "right multiplicity");
         let union_left = &union_activator * &(&left_mult * &right_mult);
@@ -723,6 +910,12 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
         let Some(right_table) = payload.get(RIGHT_LABEL).cloned() else {
             panic!("Expected right table for Match-Pair gadget");
         };
+        let Some(output_left_keys) = payload.get(OUTPUT_LEFT_KEYS_LABEL).cloned() else {
+            panic!("Expected output-left key table for Match-Pair gadget");
+        };
+        let Some(output_right_keys) = payload.get(OUTPUT_RIGHT_KEYS_LABEL).cloned() else {
+            panic!("Expected output-right key table for Match-Pair gadget");
+        };
         ensure_match_count_no_wrap::<B::F>(
             left_table.log_size(),
             right_table.log_size(),
@@ -740,6 +933,13 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
         let output_activator = output_table
             .activator_tracked_poly()
             .expect("Match-Pair output table missing activator");
+        add_output_key_equality_claims_verifier(
+            verifier,
+            &output_activator,
+            output_table.log_size(),
+            &output_left_keys,
+            &output_right_keys,
+        )?;
 
         let left_mult = single_data_oracle_from_table(&left_multiplicities, "left multiplicity");
         let right_mult = single_data_oracle_from_table(&right_multiplicities, "right multiplicity");

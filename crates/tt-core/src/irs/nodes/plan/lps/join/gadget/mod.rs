@@ -17,7 +17,7 @@ use ark_piop::{SnarkBackend, piop::PIOP};
 use col_toolbox::lookup::{LookupPIOP, LookupProverInput, LookupVerifierInput};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use datafusion::prelude::lit;
-use datafusion_expr::Join;
+use datafusion_expr::{Expr, Join, JoinType};
 use either::Either;
 use indexmap::IndexMap;
 use std::cell::RefCell;
@@ -33,6 +33,74 @@ pub const SRC_RIGHT_LABEL: &str = "__SRC_RIGHT__";
 pub const SRC_LEFT_COL_NAME: &str = "src_left";
 pub const SRC_RIGHT_COL_NAME: &str = "src_right";
 pub use crate::irs::nodes::plan::lps::join::modes::JoinMode;
+
+fn unsupported_join_error(message: impl Into<String>) -> ark_piop::errors::SnarkError {
+    ark_piop::errors::SnarkError::VerifierError(
+        ark_piop::verifier::errors::VerifierError::VerifierCheckFailed(format!(
+            "Join proof supports only plain inner equijoins: {}",
+            message.into()
+        )),
+    )
+}
+
+/// Fail closed on logical join shapes that the current Join proof does not
+/// model. In the full MANY_TO_MANY path, MatchPair proves a nonempty
+/// conjunction of column equalities and its count formula is exactly the
+/// cardinality of an inner equijoin. Outer joins, cross joins, and residual
+/// filters require different relations in every optimization mode. Nullable
+/// keys are also excluded because the current arithmetic encoding maps NULL to
+/// zero without committing a row-level validity bit, so it cannot distinguish
+/// SQL NULL from the ordinary key value zero.
+fn ensure_supported_join(join: &Join) -> ark_piop::errors::SnarkResult<()> {
+    if join.join_type != JoinType::Inner {
+        return Err(unsupported_join_error("join type must be INNER"));
+    }
+    if join.on.is_empty() {
+        return Err(unsupported_join_error(
+            "at least one equijoin key pair is required",
+        ));
+    }
+    if join.filter.is_some() {
+        return Err(unsupported_join_error(
+            "residual join filters are not yet constrained",
+        ));
+    }
+
+    for (key_index, (left, right)) in join.on.iter().enumerate() {
+        let (Expr::Column(left), Expr::Column(right)) = (left, right) else {
+            return Err(unsupported_join_error(format!(
+                "key pair {key_index} must consist of direct column references"
+            )));
+        };
+        let left_field = join.left.schema().field_from_column(left).map_err(|err| {
+            unsupported_join_error(format!(
+                "cannot resolve left key {} at position {key_index}: {err}",
+                left.flat_name()
+            ))
+        })?;
+        let right_field = join
+            .right
+            .schema()
+            .field_from_column(right)
+            .map_err(|err| {
+                unsupported_join_error(format!(
+                    "cannot resolve right key {} at position {key_index}: {err}",
+                    right.flat_name()
+                ))
+            })?;
+        if left_field.is_nullable() || right_field.is_nullable() {
+            return Err(unsupported_join_error(format!(
+                "key pair {key_index} is nullable, but NULL validity is not encoded"
+            )));
+        }
+        if left_field.data_type() != right_field.data_type() {
+            return Err(unsupported_join_error(format!(
+                "key pair {key_index} has different left/right encoding types"
+            )));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 struct JoinPlanningDerivedHints {
@@ -334,6 +402,7 @@ impl<B: SnarkBackend> ProverNodeOps<B> for GadgetNode<B> {
         id: crate::irs::nodes::NodeId,
         planned_ir: &mut crate::irs::shared_ir::OutputPlannedIr<B>,
     ) -> ark_piop::errors::SnarkResult<()> {
+        ensure_supported_join(&self.join)?;
         if let Some(gadgets) = self.many_to_many_gadgets() {
             let mut gadget_payload = match planned_ir.payload_for_node(&id) {
                 Some(PayloadStructure::GadgetPayload(map)) => map.clone(),
@@ -421,6 +490,7 @@ impl<B: SnarkBackend> ProverNodeOps<B> for GadgetNode<B> {
         _prover: &mut ark_piop::prover::ArgProver<B>,
         virtualized_ir: &mut crate::prover::irs::VirtualizedIr<B>,
     ) -> ark_piop::errors::SnarkResult<()> {
+        ensure_supported_join(&self.join)?;
         if self.many_to_many_gadgets().is_some() {
             // First fetch the payload for the current node, prepared by the parent
             let Some(PayloadStructure::GadgetPayload(payload)) =
@@ -472,6 +542,7 @@ impl<B: SnarkBackend> VerifierNodeOps<B> for GadgetNode<B> {
         id: crate::irs::nodes::NodeId,
         planned_ir: &mut crate::irs::shared_ir::OutputPlannedIr<B>,
     ) -> ark_piop::errors::SnarkResult<()> {
+        ensure_supported_join(&self.join)?;
         if let Some(gadgets) = self.many_to_many_gadgets() {
             let mut gadget_payload = match planned_ir.payload_for_node(&id) {
                 Some(PayloadStructure::GadgetPayload(map)) => map.clone(),
@@ -554,6 +625,7 @@ impl<B: SnarkBackend> VerifierNodeOps<B> for GadgetNode<B> {
         _verifier: &mut ark_piop::verifier::ArgVerifier<B>,
         virtualized_ir: &mut crate::verifier::irs::VirtualizedIr<B>,
     ) -> ark_piop::errors::SnarkResult<()> {
+        ensure_supported_join(&self.join)?;
         if self.many_to_many_gadgets().is_some() {
             let (current_output, current_left, current_right, current_left_src, current_right_src) = {
                 let Some(PayloadStructure::GadgetPayload(payload)) =
@@ -1157,6 +1229,7 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
         gadget_ready_ir: &mut GadgetReadyIr<B>,
         id: crate::irs::nodes::NodeId,
     ) -> ark_piop::errors::SnarkResult<()> {
+        ensure_supported_join(&self.join)?;
         if self.many_to_many_gadgets().is_some() {
             let Some(PayloadStructure::GadgetPayload(payload)) =
                 gadget_ready_ir.payload_for_node(&id)
@@ -1357,6 +1430,7 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
         gadget_ready_ir: &mut VerifierGadgetReadyIr<B>,
         id: crate::irs::nodes::NodeId,
     ) -> ark_piop::errors::SnarkResult<()> {
+        ensure_supported_join(&self.join)?;
         if self.many_to_many_gadgets().is_some() {
             let Some(PayloadStructure::GadgetPayload(payload)) =
                 gadget_ready_ir.payload_for_node(&id)
@@ -1518,5 +1592,77 @@ impl<B: SnarkBackend> GadgetNode<B> {
                 *gadgets = Gadgets::HasOne;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_supported_join;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_expr::{
+        Expr, Join, JoinType, LogicalPlan, LogicalPlanBuilder,
+        logical_plan::builder::LogicalTableSource,
+    };
+    use std::sync::Arc;
+
+    fn inner_join(nullable: bool) -> Join {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "key",
+            DataType::Int64,
+            nullable,
+        )]));
+        let source = Arc::new(LogicalTableSource::new(schema));
+        let left = LogicalPlanBuilder::scan("left", source.clone(), None)
+            .expect("build left scan")
+            .build()
+            .expect("finish left scan");
+        let right = LogicalPlanBuilder::scan("right", source, None)
+            .expect("build right scan")
+            .build()
+            .expect("finish right scan");
+        let plan = LogicalPlanBuilder::from(left)
+            .join(
+                right,
+                JoinType::Inner,
+                (vec!["left.key"], vec!["right.key"]),
+                None,
+            )
+            .expect("build inner join")
+            .build()
+            .expect("finish inner join");
+        match plan {
+            LogicalPlan::Join(join) => join,
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_proof_scope_accepts_plain_nonnullable_inner_equijoin() {
+        ensure_supported_join(&inner_join(false))
+            .expect("plain inner equijoin is the supported protocol scope");
+    }
+
+    #[test]
+    fn join_proof_scope_rejects_unconstrained_join_shapes() {
+        let mut non_inner = inner_join(false);
+        non_inner.join_type = JoinType::Left;
+        assert!(ensure_supported_join(&non_inner).is_err());
+
+        let mut no_keys = inner_join(false);
+        no_keys.on.clear();
+        assert!(ensure_supported_join(&no_keys).is_err());
+
+        let mut filtered = inner_join(false);
+        filtered.filter = Some(datafusion_expr::lit(true));
+        assert!(ensure_supported_join(&filtered).is_err());
+
+        let mut expression_key = inner_join(false);
+        expression_key.on[0].0 = Expr::Literal(datafusion_common::ScalarValue::Int64(Some(1)));
+        assert!(ensure_supported_join(&expression_key).is_err());
+
+        assert!(
+            ensure_supported_join(&inner_join(true)).is_err(),
+            "nullable keys must fail closed until validity bits are constrained"
+        );
     }
 }
