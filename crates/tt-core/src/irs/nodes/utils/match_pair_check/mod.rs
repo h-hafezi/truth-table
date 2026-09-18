@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
 mod hints;
+#[cfg(test)]
+mod tests;
 
-use ark_ff::{One, Zero};
+use ark_ff::{One, PrimeField, Zero};
 use ark_piop::{
-    SnarkBackend, prover::structs::polynomial::TrackedPoly,
+    SnarkBackend, arithmetic::mat_poly::mle::MLE, prover::structs::polynomial::TrackedPoly,
     verifier::structs::oracle::TrackedOracle,
 };
 use datafusion::{
-    arrow::datatypes::{Field, Schema},
+    arrow::datatypes::{DataType, Field, Schema},
     prelude::DataFrame,
 };
 use datafusion_common::{Column, DataFusionError, Result as DataFusionResult};
@@ -18,7 +20,7 @@ use tracing::error;
 
 use self::hints::build_union_hint_df;
 use crate::irs::nodes::hints::sort_by_row_id_if_present;
-use crate::irs::nodes::utils::{lookup, nodup};
+use crate::irs::nodes::utils::{bool as bool_check, lookup, nodup};
 use crate::{
     irs::{
         nodes::{IsGadgetNode, IsNode, Node, ProverNodeOps, VerifierNodeOps},
@@ -27,6 +29,97 @@ use crate::{
     prover::irs::GadgetReadyIr,
     verifier::irs::GadgetReadyIr as VerifierGadgetReadyIr,
 };
+
+fn add_match_count_claims_prover<B: SnarkBackend>(
+    prover: &mut ark_piop::prover::ArgProver<B>,
+    pair_count: &TrackedPoly<B>,
+    output_activator: &TrackedPoly<B>,
+    claimed_count: B::F,
+) -> ark_piop::errors::SnarkResult<()> {
+    // A miscellaneous proof field is not transcript-bound before Sumcheck
+    // batching.  Instead commit the claimed count as an nv=0 constant, which
+    // ark-piop appends to the transcript before it samples batching weights.
+    let count =
+        prover.track_and_commit_mat_mv_poly(&MLE::from_evaluations_vec(0, vec![claimed_count]))?;
+    let pair_difference = count_difference_prover(pair_count, &count)?;
+    let output_difference = count_difference_prover(output_activator, &count)?;
+    prover.add_mv_sumcheck_claim(pair_difference.id(), B::F::zero())?;
+    prover.add_mv_sumcheck_claim(output_difference.id(), B::F::zero())?;
+    Ok(())
+}
+
+fn add_match_count_claims_verifier<B: SnarkBackend>(
+    verifier: &mut ark_piop::verifier::ArgVerifier<B>,
+    pair_count: &TrackedOracle<B>,
+    output_activator: &TrackedOracle<B>,
+) -> ark_piop::errors::SnarkResult<()> {
+    let count = verifier.track_next_mv_com()?;
+    let pair_difference = count_difference_verifier(pair_count, &count)?;
+    let output_difference = count_difference_verifier(output_activator, &count)?;
+    verifier.add_mv_sumcheck_claim(pair_difference.id(), B::F::zero());
+    verifier.add_mv_sumcheck_claim(output_difference.id(), B::F::zero());
+    Ok(())
+}
+
+fn inverse_domain_size<F: PrimeField>(log_size: usize) -> ark_piop::errors::SnarkResult<F> {
+    F::from(2u64)
+        .pow([log_size as u64])
+        .inverse()
+        .ok_or_else(|| match_pair_check_error("Boolean-hypercube size is not invertible"))
+}
+
+/// Build a polynomial whose hypercube sum is `sum(values) - count`.
+///
+/// The committed count has zero variables, so it can be combined with either
+/// input domain. Dividing it by that domain's size makes its hypercube sum
+/// exactly `count`, even when the pair and output polynomials have different
+/// numbers of variables.
+fn count_difference_prover<B: SnarkBackend>(
+    values: &TrackedPoly<B>,
+    count: &TrackedPoly<B>,
+) -> ark_piop::errors::SnarkResult<TrackedPoly<B>> {
+    let density = count.mul_scalar_poly(inverse_domain_size::<B::F>(values.log_size())?);
+    Ok(values - &density)
+}
+
+fn count_difference_verifier<B: SnarkBackend>(
+    values: &TrackedOracle<B>,
+    count: &TrackedOracle<B>,
+) -> ark_piop::errors::SnarkResult<TrackedOracle<B>> {
+    let density = count.mul_scalar_oracle(inverse_domain_size::<B::F>(values.log_size())?);
+    Ok(values - &density)
+}
+
+/// Ensure field sums represent the natural join-pair and output-row counts.
+///
+/// With Boolean activators, the largest possible number of matching pairs is
+/// `2^left_log_size * 2^right_log_size`.  Both that count and the output's
+/// active-row count must fit below the field characteristic; otherwise equality
+/// of the two Sumcheck targets would establish only equality modulo the field.
+fn ensure_match_count_no_wrap<F: PrimeField>(
+    left_log_size: usize,
+    right_log_size: usize,
+    output_log_size: usize,
+) -> ark_piop::errors::SnarkResult<()> {
+    let pair_log_size = left_log_size
+        .checked_add(right_log_size)
+        .ok_or_else(|| match_pair_check_error("input capacities overflow usize"))?;
+    let modulus_bits = F::MODULUS_BIT_SIZE as usize;
+    if pair_log_size >= modulus_bits || output_log_size >= modulus_bits {
+        return Err(match_pair_check_error(
+            "join pair and output capacities must be below the field modulus",
+        ));
+    }
+    Ok(())
+}
+
+fn match_pair_check_error(message: &str) -> ark_piop::errors::SnarkError {
+    ark_piop::errors::SnarkError::VerifierError(
+        ark_piop::verifier::errors::VerifierError::VerifierCheckFailed(format!(
+            "Match-Pair check: {message}"
+        )),
+    )
+}
 
 /// The left join keys (either a single key or a composite key)
 pub const LEFT_LABEL: &str = "__left__";
@@ -71,6 +164,7 @@ fn union_runtime_hint(df: DataFrame) -> crate::irs::nodes::hints::HintDF {
 }
 
 pub struct GadgetNode<B: SnarkBackend> {
+    union_activator_bool_gadget: Arc<Node<B>>,
     nodup_gadget: Arc<Node<B>>,
     left_lookup_gadget: Arc<Node<B>>,
     right_lookup_gadget: Arc<Node<B>>,
@@ -127,6 +221,7 @@ impl<B: SnarkBackend> IsNode<B> for GadgetNode<B> {
 
     fn children(&self) -> Vec<std::sync::Arc<Node<B>>> {
         vec![
+            self.union_activator_bool_gadget.clone(),
             self.nodup_gadget.clone(),
             self.left_lookup_gadget.clone(),
             self.right_lookup_gadget.clone(),
@@ -217,6 +312,12 @@ impl<B: SnarkBackend> ProverNodeOps<B> for GadgetNode<B> {
             .get(RIGHT_LABEL)
             .cloned()
             .unwrap_or_else(|| panic!("Match-Pair gadget missing {}", RIGHT_LABEL));
+
+        populate_union_activator_bool_payload_prover(
+            &self.union_activator_bool_gadget,
+            &union,
+            virtualized_ir,
+        );
 
         let mut nodup_payload = match virtualized_ir.payload_for_node(&self.nodup_gadget.id()) {
             Some(PayloadStructure::GadgetPayload(map)) => map.clone(),
@@ -362,6 +463,12 @@ impl<B: SnarkBackend> VerifierNodeOps<B> for GadgetNode<B> {
         let left_keys_no_row_id = drop_row_id_keep_activator_verifier(&left_keys);
         let right_keys_no_row_id = drop_row_id_keep_activator_verifier(&right_keys);
 
+        populate_union_activator_bool_payload_verifier(
+            &self.union_activator_bool_gadget,
+            &union,
+            virtualized_ir,
+        );
+
         let mut nodup_payload = match virtualized_ir.payload_for_node(&self.nodup_gadget.id()) {
             Some(PayloadStructure::GadgetPayload(map)) => map.clone(),
             _ => IndexMap::new(),
@@ -506,6 +613,17 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
         let Some(output_table) = payload.get(OUT_LABEL).cloned() else {
             panic!("Expected output activator table for Match-Pair gadget");
         };
+        let Some(left_table) = payload.get(LEFT_LABEL).cloned() else {
+            panic!("Expected left table for Match-Pair gadget");
+        };
+        let Some(right_table) = payload.get(RIGHT_LABEL).cloned() else {
+            panic!("Expected right table for Match-Pair gadget");
+        };
+        ensure_match_count_no_wrap::<B::F>(
+            left_table.log_size(),
+            right_table.log_size(),
+            output_table.log_size(),
+        )?;
 
         let left_multiplicities =
             lookup_multiplicities_table_prover(gadget_ready_ir, &self.left_lookup_gadget);
@@ -525,10 +643,10 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
             .evaluations()
             .into_iter()
             .fold(B::F::zero(), |acc, val| acc + val);
-        let challenge = prover.get_and_append_challenge(b"match_pair_output_sum_key")?;
-        let output_sum_key = format!("match_pair_output_sum_{challenge}");
-        prover.add_miscellaneous_field_element(output_sum_key.clone(), output_sum)?;
-        prover.add_mv_sumcheck_claim(union_left.id(), output_sum)?;
+        // Both zero-sum claims share one transcript-bound count constant. The
+        // first establishes the number of matching input pairs; the second
+        // binds that number to the materialized join output's activator.
+        add_match_count_claims_prover(prover, &union_left, &output_activator, output_sum)?;
         Ok(())
     }
 
@@ -596,9 +714,20 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
         let Some(union_table) = payload.get(UNION_LABEL).cloned() else {
             panic!("Expected union table for Match-Pair gadget");
         };
-        let Some(_output_table) = payload.get(OUT_LABEL).cloned() else {
+        let Some(output_table) = payload.get(OUT_LABEL).cloned() else {
             panic!("Expected output activator table for Match-Pair gadget");
         };
+        let Some(left_table) = payload.get(LEFT_LABEL).cloned() else {
+            panic!("Expected left table for Match-Pair gadget");
+        };
+        let Some(right_table) = payload.get(RIGHT_LABEL).cloned() else {
+            panic!("Expected right table for Match-Pair gadget");
+        };
+        ensure_match_count_no_wrap::<B::F>(
+            left_table.log_size(),
+            right_table.log_size(),
+            output_table.log_size(),
+        )?;
 
         let left_multiplicities =
             lookup_multiplicities_table_verifier(gadget_ready_ir, &self.left_lookup_gadget);
@@ -608,17 +737,19 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
         let union_activator = union_table
             .activator_tracked_poly()
             .expect("Match-Pair union table missing activator");
+        let output_activator = output_table
+            .activator_tracked_poly()
+            .expect("Match-Pair output table missing activator");
 
         let left_mult = single_data_oracle_from_table(&left_multiplicities, "left multiplicity");
         let right_mult = single_data_oracle_from_table(&right_multiplicities, "right multiplicity");
 
         let union_left = &union_activator * &(&left_mult * &right_mult);
 
-        let challenge = verifier.get_and_append_challenge(b"match_pair_output_sum_key")?;
-        let output_sum_key = format!("match_pair_output_sum_{challenge}");
-        let output_sum = verifier.miscellaneous_field_element(&output_sum_key)?;
-
-        verifier.add_mv_sumcheck_claim(union_left.id(), output_sum);
+        // Mirror the prover's transcript-bound count constant and the two
+        // zero-sum differences. This remains sound when ark-piop batches the
+        // claims because the shared count precedes the batching challenges.
+        add_match_count_claims_verifier(verifier, &union_left, &output_activator)?;
         Ok(())
     }
 
@@ -639,6 +770,8 @@ impl<B: SnarkBackend> Default for GadgetNode<B> {
 
 impl<B: SnarkBackend> GadgetNode<B> {
     pub fn new() -> Self {
+        let union_activator_bool_gadget =
+            Arc::new(Node::<B>::Gadget(Arc::new(bool_check::GadgetNode::new())));
         let nodup_gadget = Arc::new(Node::<B>::Gadget(Arc::new(
             crate::irs::nodes::utils::nodup::GadgetNode::default(),
         )));
@@ -649,11 +782,88 @@ impl<B: SnarkBackend> GadgetNode<B> {
             crate::irs::nodes::utils::lookup::GadgetNode::new(),
         )));
         Self {
+            union_activator_bool_gadget,
             nodup_gadget,
             left_lookup_gadget,
             right_lookup_gadget,
         }
     }
+}
+
+/// Reinterpret the union activator as ordinary data with no gating activator.
+///
+/// BoolCheck gates a data column when its table carries an activator.  Here the
+/// value being checked *is* the activator, so attaching it again as a gate would
+/// accept arbitrary values at zero-weight slots.  The synthetic one-column
+/// table deliberately has no system activator and therefore checks every slot.
+fn union_activator_bool_table_prover<B: SnarkBackend>(
+    union: &arithmetic::table::TrackedTable<B>,
+) -> arithmetic::table::TrackedTable<B> {
+    let activator = union
+        .activator_tracked_poly()
+        .expect("Match-Pair union table should carry an activator column");
+    let field = Arc::new(Field::new("union_activator", DataType::Boolean, false));
+    let mut tracked_polys = IndexMap::new();
+    tracked_polys.insert(field.clone(), activator);
+    arithmetic::table::TrackedTable::new(
+        Some(Schema::new(vec![field.as_ref().clone()])),
+        tracked_polys,
+        union.log_size(),
+    )
+}
+
+fn union_activator_bool_table_verifier<B: SnarkBackend>(
+    union: &arithmetic::table_oracle::TrackedTableOracle<B>,
+) -> arithmetic::table_oracle::TrackedTableOracle<B> {
+    let activator = union
+        .activator_tracked_poly()
+        .expect("Match-Pair union table should carry an activator column");
+    let field = Arc::new(Field::new("union_activator", DataType::Boolean, false));
+    let mut tracked_oracles = IndexMap::new();
+    tracked_oracles.insert(field.clone(), activator);
+    arithmetic::table_oracle::TrackedTableOracle::new(
+        Some(Schema::new(vec![field.as_ref().clone()])),
+        tracked_oracles,
+        union.log_size(),
+    )
+}
+
+fn populate_union_activator_bool_payload_prover<B: SnarkBackend>(
+    bool_gadget: &Arc<Node<B>>,
+    union: &arithmetic::table::TrackedTable<B>,
+    virtualized_ir: &mut crate::prover::irs::VirtualizedIr<B>,
+) {
+    let mut bool_payload = match virtualized_ir.payload_for_node(&bool_gadget.id()) {
+        Some(PayloadStructure::GadgetPayload(map)) => map.clone(),
+        _ => IndexMap::new(),
+    };
+    bool_payload.insert(
+        bool_check::TABLE_LABEL.to_string(),
+        union_activator_bool_table_prover(union),
+    );
+    virtualized_ir.set_payload_for_node(
+        bool_gadget.id(),
+        Some(PayloadStructure::GadgetPayload(bool_payload)),
+    );
+}
+
+fn populate_union_activator_bool_payload_verifier<B: SnarkBackend>(
+    bool_gadget: &Arc<Node<B>>,
+    union: &arithmetic::table_oracle::TrackedTableOracle<B>,
+    virtualized_ir: &mut crate::verifier::irs::VirtualizedIr<B>,
+) {
+    let mut bool_payload = match virtualized_ir.payload_for_node(&bool_gadget.id()) {
+        Some(PayloadStructure::GadgetPayload(map)) => map.clone(),
+        _ => IndexMap::new(),
+    };
+    bool_payload.insert(
+        bool_check::TABLE_LABEL.to_string(),
+        union_activator_bool_table_verifier(union),
+    );
+    virtualized_ir.set_payload_for_node(
+        bool_gadget.id(),
+        Some(PayloadStructure::GadgetPayload(bool_payload)),
+    );
 }
 
 fn drop_row_id_keep_activator_prover<B: SnarkBackend>(
