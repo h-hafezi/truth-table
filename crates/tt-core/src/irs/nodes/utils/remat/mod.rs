@@ -1,13 +1,13 @@
 //! Rematerialization checks active-row bag equality and, when requested,
 //! requires the output activator to be an exact prefix of ones. Prefix mode
-//! publishes the active-row count as proof metadata, so callers must include
-//! that cardinality in their leakage model.
+//! transcript-binds the active-row count as a zero-variable proof constant,
+//! so callers must include that cardinality in their leakage model.
 
 use std::sync::Arc;
 
 use arithmetic::{table::TrackedTable, table_oracle::TrackedTableOracle};
 use ark_ff::{BigInteger, One, PrimeField, Zero};
-use ark_piop::SnarkBackend;
+use ark_piop::{SnarkBackend, arithmetic::mat_poly::mle::MLE};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use indexmap::IndexMap;
 
@@ -173,9 +173,17 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
         }
         let active_count_u64 = u64::try_from(active_count)
             .map_err(|_| remat_check_error("contiguous output count does not fit into u64"))?;
-        let challenge = prover.get_and_append_challenge(b"remat_contiguous_count_key")?;
-        let count_key = format!("remat_contiguous_count_{challenge}");
-        prover.add_miscellaneous_field_element(count_key, B::F::from(active_count_u64))?;
+        // The prefix length determines the public polynomial used below, so
+        // it must be transcript-bound before the resulting zerocheck is
+        // batched. A miscellaneous proof field is not sufficient: a prover
+        // could otherwise choose the length after seeing the batching
+        // challenges. Constants use a zero-variable proof entry encoded
+        // directly in, and appended to, the Fiat--Shamir transcript.
+        let active_count_field = B::F::from(active_count_u64);
+        prover.track_and_commit_mat_mv_poly(&MLE::from_evaluations_vec(
+            0,
+            vec![active_count_field],
+        ))?;
 
         let prefix = activator
             .tracker()
@@ -228,9 +236,19 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
             .activator_tracked_poly()
             .ok_or_else(|| remat_check_error("contiguous output is missing its activator"))?;
         let capacity = checked_capacity::<B::F>(output.log_size())?;
-        let challenge = verifier.get_and_append_challenge(b"remat_contiguous_count_key")?;
-        let count_key = format!("remat_contiguous_count_{challenge}");
-        let active_count = field_to_usize(verifier.miscellaneous_field_element(&count_key)?)?;
+        // Mirror the prover's zero-variable count proof entry. Tracking the
+        // next entry appends its value to the verifier transcript in the
+        // same position before we use it to choose the public prefix.
+        let active_count_oracle = verifier.track_next_mv_com()?;
+        if active_count_oracle.log_size() != 0 {
+            return Err(remat_check_error(
+                "contiguous output count proof entry has variables",
+            ));
+        }
+        let active_count_field = active_count_oracle
+            .as_constant()
+            .ok_or_else(|| remat_check_error("contiguous output count is not a proof constant"))?;
+        let active_count = field_to_usize(active_count_field)?;
         if active_count > capacity {
             return Err(remat_check_error(
                 "contiguous output count exceeds its capacity",
