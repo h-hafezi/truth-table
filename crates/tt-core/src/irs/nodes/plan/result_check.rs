@@ -5,7 +5,7 @@ use crate::irs::payloads::PayloadStructure;
 use arithmetic::{ACTIVATOR_COL_NAME, table::TrackedTable, table_oracle::TrackedTableOracle};
 use ark_ff::PrimeField;
 use ark_piop::SnarkBackend;
-use datafusion::arrow::datatypes::{DataType, IntervalUnit, Schema};
+use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion_common::{DFSchemaRef, DataFusionError};
 use datafusion_expr::{
     Expr, LogicalPlan,
@@ -389,61 +389,16 @@ fn validate_result_schema<B: SnarkBackend>(
 
 /// Reject public SQL types whose current field encoding is not injective.
 ///
-/// Decimal256 is reduced modulo the field characteristic by the current
-/// encoder. Decimal128 and the 128-bit MonthDayNano interval encoding are
-/// injective only when the field is wider than 128 bits. Nested types are
-/// checked recursively even though most are rejected earlier by today's query
-/// and encoding pipelines.
+/// Keep the public-result boundary on the same recursive safety predicate as
+/// prover arithmetization and verifier hint tracking. This prevents the three
+/// paths from drifting on nested types or on wider fields that can safely
+/// represent the complete fixed-width source word.
 pub fn validate_public_result_encoding<F: PrimeField>(
     schema: &Schema,
 ) -> ark_piop::errors::SnarkResult<()> {
     for field in schema.fields() {
-        validate_public_data_type::<F>(field.data_type())?;
-    }
-    Ok(())
-}
-
-fn validate_public_data_type<F: PrimeField>(
-    data_type: &DataType,
-) -> ark_piop::errors::SnarkResult<()> {
-    match data_type {
-        DataType::Decimal256(_, _) => {
-            return Err(result_schema_error(
-                "Decimal256 public results are unsupported because their field encoding is not injective",
-            ));
-        }
-        DataType::Decimal128(_, _) | DataType::Interval(IntervalUnit::MonthDayNano)
-            if F::MODULUS_BIT_SIZE <= 128 =>
-        {
-            return Err(result_schema_error(
-                "128-bit public values require a field wider than 128 bits",
-            ));
-        }
-        DataType::List(field)
-        | DataType::ListView(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::LargeList(field)
-        | DataType::LargeListView(field)
-        | DataType::Map(field, _) => validate_public_data_type::<F>(field.data_type())?,
-        DataType::Struct(fields) => {
-            for field in fields.iter() {
-                validate_public_data_type::<F>(field.data_type())?;
-            }
-        }
-        DataType::Union(fields, _) => {
-            for (_, field) in fields.iter() {
-                validate_public_data_type::<F>(field.data_type())?;
-            }
-        }
-        DataType::Dictionary(key, value) => {
-            validate_public_data_type::<F>(key)?;
-            validate_public_data_type::<F>(value)?;
-        }
-        DataType::RunEndEncoded(run_ends, values) => {
-            validate_public_data_type::<F>(run_ends.data_type())?;
-            validate_public_data_type::<F>(values.data_type())?;
-        }
-        _ => {}
+        arithmetic::encoding::validate_fixed_width_encoding_safety::<F>(field.data_type())
+            .map_err(|error| result_schema_error(&error.to_string()))?;
     }
     Ok(())
 }
@@ -594,6 +549,7 @@ mod tests {
     use super::{validate_public_result_encoding, validate_result_schema};
     use arithmetic::ACTIVATOR_COL_NAME;
     use ark_piop::DefaultSnarkBackend;
+    use ark_test_curves::bls12_381::Fq;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
@@ -656,6 +612,17 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn public_result_encoding_allows_decimal256_in_a_wider_field() {
+        let schema = Schema::new(vec![Field::new(
+            "value",
+            DataType::Decimal256(76, 0),
+            false,
+        )]);
+
+        assert!(validate_public_result_encoding::<Fq>(&schema).is_ok());
     }
 
     #[test]

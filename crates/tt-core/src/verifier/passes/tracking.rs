@@ -87,16 +87,6 @@ impl<B: SnarkBackend> TrackingPass<B> {
             )
             .into());
         }
-        for field in output_memtable.schema().fields() {
-            arithmetic::encoding::validate_fixed_width_encoding_safety::<B::F>(field.data_type())
-                .map_err(|error| {
-                DataFusionError::Plan(format!(
-                    "unsupported verifier output encoding for field `{}`: {error}",
-                    field.name()
-                ))
-            })?;
-        }
-
         // Treat even low-level callers' table as raw public data. Validation
         // and activation normalization live here so no caller can bypass them
         // by constructing TrackingPass directly.
@@ -661,8 +651,8 @@ mod tests {
     use ark_piop::DefaultSnarkBackend;
     use datafusion::{
         arrow::{
-            array::{ArrayRef, BooleanArray, Int64Array},
-            datatypes::{DataType, Field, Schema},
+            array::{ArrayRef, BooleanArray, Decimal256Array, Int64Array},
+            datatypes::{DataType, Field, Schema, i256},
             record_batch::RecordBatch,
         },
         datasource::MemTable,
@@ -730,6 +720,26 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn raw_public_result_rejects_noninjective_decimal256() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal256(76, 0),
+            false,
+        )]));
+        let decimal = Decimal256Array::from(vec![Some(i256::MINUS_ONE)])
+            .with_precision_and_scale(76, 0)
+            .unwrap();
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(decimal) as ArrayRef]).unwrap();
+        let table = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap());
+
+        let error = TrackingPass::<DefaultSnarkBackend>::normalize_output_memtable(table)
+            .await
+            .expect_err("BN254 cannot injectively encode Decimal256 public values");
+        assert!(error.to_string().contains("Decimal256"));
     }
 
     #[test]
