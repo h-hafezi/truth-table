@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use ark_ff::{Field as _, PrimeField, Zero};
 use ark_piop::{
@@ -9,11 +9,18 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use indexmap::IndexMap;
 
 use super::{
-    GadgetNode, add_match_count_claims_prover, add_match_count_claims_verifier,
+    GadgetNode, LEFT_LABEL, RIGHT_LABEL, UNION_LABEL, activator_bool_table_prover,
+    activator_bool_table_verifier, add_match_count_claims_prover, add_match_count_claims_verifier,
     add_output_key_equality_claims_prover, add_output_key_equality_claims_verifier,
-    ensure_match_count_no_wrap, union_activator_bool_table_prover,
+    ensure_match_count_no_wrap,
 };
-use crate::irs::nodes::IsNode;
+use crate::irs::{
+    ir::Ir,
+    nodes::utils::bool as bool_check,
+    nodes::{IsGadgetNode, IsNode, Node, ProverNodeOps, VerifierNodeOps},
+    payloads::PayloadStructure,
+    tree::Tree,
+};
 
 type B = DefaultSnarkBackend;
 type F = <B as SnarkBackend>::F;
@@ -36,8 +43,35 @@ fn tracked_key_table(
     arithmetic::table::TrackedTable::new(Some(Schema::new(fields)), polys, log_size)
 }
 
+fn tracked_active_key_table(
+    prover: &mut ark_piop::prover::ArgProver<B>,
+    name: &str,
+    values: Vec<F>,
+    active: Vec<F>,
+    log_size: usize,
+) -> arithmetic::table::TrackedTable<B> {
+    let field = Arc::new(Field::new(name, DataType::Int64, false));
+    let data = prover
+        .track_and_commit_mat_mv_poly(&MLE::from_evaluations_vec(log_size, values))
+        .expect("commit key column");
+    let activator = prover
+        .track_and_commit_mat_mv_poly(&MLE::from_evaluations_vec(log_size, active))
+        .expect("commit key activator");
+    let mut polys = IndexMap::new();
+    polys.insert(field.clone(), data);
+    polys.insert(arithmetic::ACTIVATOR_FIELD.clone(), activator);
+    arithmetic::table::TrackedTable::new(
+        Some(Schema::new(vec![
+            field.as_ref().clone(),
+            arithmetic::ACTIVATOR_FIELD.as_ref().clone(),
+        ])),
+        polys,
+        log_size,
+    )
+}
+
 #[test]
-fn union_activator_booleanity_is_ungated() {
+fn input_activator_booleanity_is_ungated_and_rejects_fractional_weights() {
     let (mut prover, _) = prelude_with_vars::<B>(2).expect("SRS setup");
     let half = F::from(2u64).inverse().expect("two is invertible");
     let activator = prover
@@ -56,7 +90,8 @@ fn union_activator_booleanity_is_ungated() {
         2,
     );
 
-    let bool_input = union_activator_bool_table_prover(&union);
+    let bool_input = activator_bool_table_prover(&union, "left_activator")
+        .expect("build ungated activator BoolCheck input");
     assert!(
         bool_input.activator_tracked_poly().is_none(),
         "the value being checked must not also gate its own BoolCheck"
@@ -71,14 +106,37 @@ fn union_activator_booleanity_is_ungated() {
         vec![half, half, F::from(1u64), F::zero()]
     );
 
-    let child_names = GadgetNode::<B>::new()
+    let bool_gadget = Arc::new(bool_check::GadgetNode::<B>::new());
+    let bool_root: Arc<Node<B>> = Arc::new(Node::Gadget(bool_gadget.clone()));
+    let bool_id = bool_root.id();
+    let mut bool_ir: crate::prover::irs::GadgetReadyIr<B> =
+        Ir::new_empty(Tree::new_from_root(bool_root));
+    bool_ir.set_payload_for_node(
+        bool_id,
+        Some(PayloadStructure::GadgetPayload(IndexMap::from([(
+            bool_check::TABLE_LABEL.to_string(),
+            bool_input,
+        )]))),
+    );
+    assert!(
+        <bool_check::GadgetNode<B> as IsGadgetNode<B>>::honest_prover_check(
+            bool_gadget.as_ref(),
+            &mut prover,
+            &mut bool_ir,
+            bool_id,
+        )
+        .is_err(),
+        "fractional input activators must fail the ungated BoolCheck"
+    );
+
+    let bool_child_count = GadgetNode::<B>::new()
         .children()
         .into_iter()
-        .map(|child| child.name())
-        .collect::<HashSet<_>>();
-    assert!(
-        child_names.contains("Bool"),
-        "MatchPair must execute the union-activator BoolCheck child"
+        .filter(|child| child.name() == "Bool")
+        .count();
+    assert_eq!(
+        bool_child_count, 3,
+        "MatchPair must execute separate union, left-input, and right-input BoolChecks"
     );
 }
 
@@ -418,4 +476,251 @@ fn output_key_equality_rejects_shape_and_domain_mismatches() {
         .is_err(),
         "different output row domains must fail closed in release builds"
     );
+}
+
+#[test]
+fn union_nodup_uses_the_runtime_union_commitments() {
+    let (mut prover, mut verifier) = prelude_with_vars::<B>(3).expect("SRS setup");
+    let active = vec![F::from(1u64), F::zero()];
+    let union = tracked_active_key_table(
+        &mut prover,
+        "__mp_key_0",
+        vec![F::from(7u64), F::zero()],
+        active.clone(),
+        1,
+    );
+    let left = tracked_active_key_table(
+        &mut prover,
+        "__mp_key_0",
+        vec![F::from(7u64), F::zero()],
+        active.clone(),
+        1,
+    );
+    let right = tracked_active_key_table(
+        &mut prover,
+        "__mp_key_0",
+        vec![F::from(7u64), F::zero()],
+        active.clone(),
+        1,
+    );
+    let sentinel = tracked_active_key_table(
+        &mut prover,
+        "sentinel",
+        vec![F::from(99u64), F::zero()],
+        active,
+        1,
+    );
+
+    let gadget = Arc::new(GadgetNode::<B>::new());
+    let union_bool_id = gadget.union_activator_bool_gadget.id();
+    let left_bool_id = gadget.left_activator_bool_gadget.id();
+    let right_bool_id = gadget.right_activator_bool_gadget.id();
+    let nodup_id = gadget.nodup_gadget.id();
+    let root = Arc::new(Node::Gadget(gadget.clone()));
+    let root_id = root.id();
+    let tree = Tree::new_from_root(root);
+    let mut prover_ir: crate::prover::irs::VirtualizedIr<B> = Ir::new_empty(tree.clone());
+    prover_ir.set_payload_for_node(
+        root_id,
+        Some(PayloadStructure::GadgetPayload(IndexMap::from([
+            (UNION_LABEL.to_string(), union.clone()),
+            (LEFT_LABEL.to_string(), left.clone()),
+            (RIGHT_LABEL.to_string(), right.clone()),
+        ]))),
+    );
+    prover_ir.set_payload_for_node(
+        nodup_id,
+        Some(PayloadStructure::GadgetPayload(IndexMap::from([(
+            crate::irs::nodes::utils::nodup::INPUT_LABEL.to_string(),
+            sentinel.clone(),
+        )]))),
+    );
+    let sentinel_bool = activator_bool_table_prover(&sentinel, "sentinel_activator")
+        .expect("build sentinel BoolCheck table");
+    for bool_id in [union_bool_id, left_bool_id, right_bool_id] {
+        prover_ir.set_payload_for_node(
+            bool_id,
+            Some(PayloadStructure::GadgetPayload(IndexMap::from([(
+                bool_check::TABLE_LABEL.to_string(),
+                sentinel_bool.clone(),
+            )]))),
+        );
+    }
+    <GadgetNode<B> as ProverNodeOps<B>>::initialize_gadgets(
+        gadget.as_ref(),
+        root_id,
+        &mut prover,
+        &mut prover_ir,
+    )
+    .expect("wire MatchPair children");
+    let PayloadStructure::GadgetPayload(bound) = prover_ir
+        .payload_for_node(&nodup_id)
+        .expect("NoDup child payload")
+    else {
+        panic!("expected gadget payload")
+    };
+    let bound = bound
+        .get(crate::irs::nodes::utils::nodup::INPUT_LABEL)
+        .expect("NoDup input");
+    let union_ids = union
+        .tracked_polys()
+        .values()
+        .map(|poly| poly.id())
+        .collect::<Vec<_>>();
+    let bound_ids = bound
+        .tracked_polys()
+        .values()
+        .map(|poly| poly.id())
+        .collect::<Vec<_>>();
+    assert_eq!(bound_ids, union_ids);
+
+    // Each Bool child must be rebound from any planning payload to the exact
+    // runtime activator it is responsible for. This is what prevents a
+    // prover from checking an unrelated Boolean column while using
+    // fractional input weights in the MatchPair equations.
+    for (bool_id, expected, expected_name) in [
+        (union_bool_id, &union, "union_activator"),
+        (left_bool_id, &left, "left_activator"),
+        (right_bool_id, &right, "right_activator"),
+    ] {
+        let PayloadStructure::GadgetPayload(payload) = prover_ir
+            .payload_for_node(&bool_id)
+            .expect("Bool child payload")
+        else {
+            panic!("expected Bool gadget payload")
+        };
+        let checked = payload
+            .get(bool_check::TABLE_LABEL)
+            .expect("Bool input table");
+        assert!(checked.activator_tracked_poly().is_none());
+        let data_indices = checked.data_tracked_polys_indices();
+        assert_eq!(data_indices.len(), 1);
+        assert_eq!(
+            checked
+                .tracked_col_by_ind(data_indices[0])
+                .data_tracked_poly()
+                .id(),
+            expected
+                .activator_tracked_poly()
+                .expect("runtime table activator")
+                .id()
+        );
+        assert_eq!(
+            checked
+                .tracked_polys()
+                .first()
+                .expect("synthetic Bool column")
+                .0
+                .name(),
+            expected_name
+        );
+    }
+
+    let proof = prover.build_proof().expect("build commitment proof");
+    verifier.set_proof(proof);
+    let union_oracle =
+        arithmetic::table_oracle::TrackedTableOracle::from_tracked_table(union, &mut verifier)
+            .expect("track union");
+    let left_oracle =
+        arithmetic::table_oracle::TrackedTableOracle::from_tracked_table(left, &mut verifier)
+            .expect("track left");
+    let right_oracle =
+        arithmetic::table_oracle::TrackedTableOracle::from_tracked_table(right, &mut verifier)
+            .expect("track right");
+    let sentinel_oracle =
+        arithmetic::table_oracle::TrackedTableOracle::from_tracked_table(sentinel, &mut verifier)
+            .expect("track sentinel");
+    let mut verifier_ir: crate::verifier::irs::VirtualizedIr<B> = Ir::new_empty(tree);
+    verifier_ir.set_payload_for_node(
+        root_id,
+        Some(PayloadStructure::GadgetPayload(IndexMap::from([
+            (UNION_LABEL.to_string(), union_oracle.clone()),
+            (LEFT_LABEL.to_string(), left_oracle.clone()),
+            (RIGHT_LABEL.to_string(), right_oracle.clone()),
+        ]))),
+    );
+    verifier_ir.set_payload_for_node(
+        nodup_id,
+        Some(PayloadStructure::GadgetPayload(IndexMap::from([(
+            crate::irs::nodes::utils::nodup::INPUT_LABEL.to_string(),
+            sentinel_oracle.clone(),
+        )]))),
+    );
+    let sentinel_bool_oracle =
+        activator_bool_table_verifier(&sentinel_oracle, "sentinel_activator")
+            .expect("build sentinel verifier BoolCheck table");
+    for bool_id in [union_bool_id, left_bool_id, right_bool_id] {
+        verifier_ir.set_payload_for_node(
+            bool_id,
+            Some(PayloadStructure::GadgetPayload(IndexMap::from([(
+                bool_check::TABLE_LABEL.to_string(),
+                sentinel_bool_oracle.clone(),
+            )]))),
+        );
+    }
+    <GadgetNode<B> as VerifierNodeOps<B>>::initialize_gadgets(
+        gadget.as_ref(),
+        root_id,
+        &mut verifier,
+        &mut verifier_ir,
+    )
+    .expect("wire verifier MatchPair children");
+    let PayloadStructure::GadgetPayload(bound) = verifier_ir
+        .payload_for_node(&nodup_id)
+        .expect("verifier NoDup child payload")
+    else {
+        panic!("expected verifier gadget payload")
+    };
+    let bound = bound
+        .get(crate::irs::nodes::utils::nodup::INPUT_LABEL)
+        .expect("verifier NoDup input");
+    let union_ids = union_oracle
+        .tracked_oracles()
+        .values()
+        .map(|oracle| oracle.id())
+        .collect::<Vec<_>>();
+    let bound_ids = bound
+        .tracked_oracles()
+        .values()
+        .map(|oracle| oracle.id())
+        .collect::<Vec<_>>();
+    assert_eq!(bound_ids, union_ids);
+
+    for (bool_id, expected, expected_name) in [
+        (union_bool_id, &union_oracle, "union_activator"),
+        (left_bool_id, &left_oracle, "left_activator"),
+        (right_bool_id, &right_oracle, "right_activator"),
+    ] {
+        let PayloadStructure::GadgetPayload(payload) = verifier_ir
+            .payload_for_node(&bool_id)
+            .expect("verifier Bool child payload")
+        else {
+            panic!("expected verifier Bool gadget payload")
+        };
+        let checked = payload
+            .get(bool_check::TABLE_LABEL)
+            .expect("verifier Bool input table");
+        assert!(checked.activator_tracked_poly().is_none());
+        let data_indices = checked.data_tracked_oracles_indices();
+        assert_eq!(data_indices.len(), 1);
+        assert_eq!(
+            checked
+                .tracked_col_oracle_by_ind(data_indices[0])
+                .data_tracked_oracle()
+                .id(),
+            expected
+                .activator_tracked_poly()
+                .expect("runtime table activator oracle")
+                .id()
+        );
+        assert_eq!(
+            checked
+                .tracked_oracles()
+                .first()
+                .expect("synthetic verifier Bool column")
+                .0
+                .name(),
+            expected_name
+        );
+    }
 }

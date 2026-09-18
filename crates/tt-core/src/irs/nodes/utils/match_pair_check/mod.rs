@@ -20,7 +20,10 @@ use tracing::error;
 
 use self::hints::build_union_hint_df;
 use crate::irs::nodes::hints::sort_by_row_id_if_present;
-use crate::irs::nodes::utils::{bool as bool_check, lookup, nodup};
+use crate::irs::nodes::utils::{
+    bool as bool_check, lookup, nodup, validate_tracked_oracle_table_row_domain,
+    validate_tracked_table_row_domain,
+};
 use crate::{
     irs::{
         nodes::{IsGadgetNode, IsNode, Node, ProverNodeOps, VerifierNodeOps},
@@ -119,6 +122,44 @@ fn match_pair_check_error(message: &str) -> ark_piop::errors::SnarkError {
             "Match-Pair check: {message}"
         )),
     )
+}
+
+fn ensure_table_tracker_prover<B: SnarkBackend>(
+    reference: &TrackedPoly<B>,
+    table: &arithmetic::table::TrackedTable<B>,
+    label: &str,
+) -> ark_piop::errors::SnarkResult<()> {
+    let columns = table.tracked_polys();
+    let Some((_, first)) = columns.first() else {
+        return Err(match_pair_check_error(&format!(
+            "{label} has no row-domain columns"
+        )));
+    };
+    if !reference.same_tracker(first) {
+        return Err(match_pair_check_error(&format!(
+            "{label} belongs to a different proof tracker"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_table_tracker_verifier<B: SnarkBackend>(
+    reference: &TrackedOracle<B>,
+    table: &arithmetic::table_oracle::TrackedTableOracle<B>,
+    label: &str,
+) -> ark_piop::errors::SnarkResult<()> {
+    let columns = table.tracked_oracles();
+    let Some((_, first)) = columns.first() else {
+        return Err(match_pair_check_error(&format!(
+            "{label} has no row-domain oracles"
+        )));
+    };
+    if !reference.same_tracker(first) {
+        return Err(match_pair_check_error(&format!(
+            "{label} belongs to a different proof tracker"
+        )));
+    }
+    Ok(())
 }
 
 /// Enforce equality of every row-domain encoding segment for each output key.
@@ -339,6 +380,8 @@ fn union_runtime_hint(df: DataFrame) -> crate::irs::nodes::hints::HintDF {
 
 pub struct GadgetNode<B: SnarkBackend> {
     union_activator_bool_gadget: Arc<Node<B>>,
+    left_activator_bool_gadget: Arc<Node<B>>,
+    right_activator_bool_gadget: Arc<Node<B>>,
     nodup_gadget: Arc<Node<B>>,
     left_lookup_gadget: Arc<Node<B>>,
     right_lookup_gadget: Arc<Node<B>>,
@@ -396,6 +439,8 @@ impl<B: SnarkBackend> IsNode<B> for GadgetNode<B> {
     fn children(&self) -> Vec<std::sync::Arc<Node<B>>> {
         vec![
             self.union_activator_bool_gadget.clone(),
+            self.left_activator_bool_gadget.clone(),
+            self.right_activator_bool_gadget.clone(),
             self.nodup_gadget.clone(),
             self.left_lookup_gadget.clone(),
             self.right_lookup_gadget.clone(),
@@ -486,20 +531,49 @@ impl<B: SnarkBackend> ProverNodeOps<B> for GadgetNode<B> {
             .get(RIGHT_LABEL)
             .cloned()
             .unwrap_or_else(|| panic!("Match-Pair gadget missing {}", RIGHT_LABEL));
+        validate_tracked_table_row_domain(&union, "Match-Pair union")?;
+        validate_tracked_table_row_domain(&left_keys, "Match-Pair left keys")?;
+        validate_tracked_table_row_domain(&right_keys, "Match-Pair right keys")?;
+        let union_activator = union
+            .activator_tracked_poly()
+            .ok_or_else(|| match_pair_check_error("union table is missing its activator"))?;
+        ensure_table_tracker_prover(&union_activator, &left_keys, "left-key table")?;
+        ensure_table_tracker_prover(&union_activator, &right_keys, "right-key table")?;
 
-        populate_union_activator_bool_payload_prover(
+        // The multiplicity and count equations below interpret all three
+        // activators as ordinary set-membership bits.  Check each exact
+        // runtime commitment independently: checking only the union would
+        // leave fractional input weights available to satisfy the weighted
+        // lookup and pair-count equations without representing SQL rows.
+        populate_activator_bool_payload_prover(
             &self.union_activator_bool_gadget,
             &union,
+            "union_activator",
             virtualized_ir,
-        );
+        )?;
+        populate_activator_bool_payload_prover(
+            &self.left_activator_bool_gadget,
+            &left_keys,
+            "left_activator",
+            virtualized_ir,
+        )?;
+        populate_activator_bool_payload_prover(
+            &self.right_activator_bool_gadget,
+            &right_keys,
+            "right_activator",
+            virtualized_ir,
+        )?;
 
         let mut nodup_payload = match virtualized_ir.payload_for_node(&self.nodup_gadget.id()) {
             Some(PayloadStructure::GadgetPayload(map)) => map.clone(),
             _ => IndexMap::new(),
         };
-        nodup_payload
-            .entry(nodup::INPUT_LABEL.to_string())
-            .or_insert_with(|| union.clone());
+        // Planning provides a materialization hint for NoDup, but the proved
+        // relation must use the exact union table whose multiplicities and
+        // activator are constrained below. Retaining an independently
+        // committed hint would let a duplicated runtime union pass NoDup by
+        // supplying a separate, duplicate-free table to that child gadget.
+        nodup_payload.insert(nodup::INPUT_LABEL.to_string(), union.clone());
         virtualized_ir.set_payload_for_node(
             self.nodup_gadget.id(),
             Some(PayloadStructure::GadgetPayload(nodup_payload)),
@@ -633,23 +707,44 @@ impl<B: SnarkBackend> VerifierNodeOps<B> for GadgetNode<B> {
                     .unwrap_or_else(|| panic!("Match-Pair gadget missing {}", RIGHT_LABEL)),
             )
         };
+        validate_tracked_oracle_table_row_domain(&union, "Match-Pair union")?;
+        validate_tracked_oracle_table_row_domain(&left_keys, "Match-Pair left keys")?;
+        validate_tracked_oracle_table_row_domain(&right_keys, "Match-Pair right keys")?;
+        let union_activator = union
+            .activator_tracked_poly()
+            .ok_or_else(|| match_pair_check_error("union table is missing its activator"))?;
+        ensure_table_tracker_verifier(&union_activator, &left_keys, "left-key table")?;
+        ensure_table_tracker_verifier(&union_activator, &right_keys, "right-key table")?;
         let union_no_row_id = drop_row_id_keep_activator_verifier(&union);
         let left_keys_no_row_id = drop_row_id_keep_activator_verifier(&left_keys);
         let right_keys_no_row_id = drop_row_id_keep_activator_verifier(&right_keys);
 
-        populate_union_activator_bool_payload_verifier(
+        populate_activator_bool_payload_verifier(
             &self.union_activator_bool_gadget,
             &union,
+            "union_activator",
             virtualized_ir,
-        );
+        )?;
+        populate_activator_bool_payload_verifier(
+            &self.left_activator_bool_gadget,
+            &left_keys,
+            "left_activator",
+            virtualized_ir,
+        )?;
+        populate_activator_bool_payload_verifier(
+            &self.right_activator_bool_gadget,
+            &right_keys,
+            "right_activator",
+            virtualized_ir,
+        )?;
 
         let mut nodup_payload = match virtualized_ir.payload_for_node(&self.nodup_gadget.id()) {
             Some(PayloadStructure::GadgetPayload(map)) => map.clone(),
             _ => IndexMap::new(),
         };
-        nodup_payload
-            .entry(nodup::INPUT_LABEL.to_string())
-            .or_insert_with(|| union.clone());
+        // Mirror the prover: bind NoDup to the runtime union oracles rather
+        // than to the independent planning materialization.
+        nodup_payload.insert(nodup::INPUT_LABEL.to_string(), union.clone());
         virtualized_ir.set_payload_for_node(
             self.nodup_gadget.id(),
             Some(PayloadStructure::GadgetPayload(nodup_payload)),
@@ -799,6 +894,12 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
         let Some(output_right_keys) = payload.get(OUTPUT_RIGHT_KEYS_LABEL).cloned() else {
             panic!("Expected output-right key table for Match-Pair gadget");
         };
+        validate_tracked_table_row_domain(&union_table, "Match-Pair union")?;
+        validate_tracked_table_row_domain(&output_table, "Match-Pair output")?;
+        validate_tracked_table_row_domain(&left_table, "Match-Pair left keys")?;
+        validate_tracked_table_row_domain(&right_table, "Match-Pair right keys")?;
+        validate_tracked_table_row_domain(&output_left_keys, "Match-Pair output-left keys")?;
+        validate_tracked_table_row_domain(&output_right_keys, "Match-Pair output-right keys")?;
         ensure_match_count_no_wrap::<B::F>(
             left_table.log_size(),
             right_table.log_size(),
@@ -809,12 +910,35 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
             lookup_multiplicities_table_prover(gadget_ready_ir, &self.left_lookup_gadget);
         let right_multiplicities =
             lookup_multiplicities_table_prover(gadget_ready_ir, &self.right_lookup_gadget);
+        validate_tracked_table_row_domain(&left_multiplicities, "Match-Pair left multiplicities")?;
+        validate_tracked_table_row_domain(
+            &right_multiplicities,
+            "Match-Pair right multiplicities",
+        )?;
+        if left_multiplicities.log_size() != union_table.log_size()
+            || right_multiplicities.log_size() != union_table.log_size()
+        {
+            return Err(match_pair_check_error(
+                "union and lookup multiplicities must share one row domain",
+            ));
+        }
         let union_activator = union_table
             .activator_tracked_poly()
-            .expect("Match-Pair union table missing activator");
+            .ok_or_else(|| match_pair_check_error("union table is missing its activator"))?;
         let output_activator = output_table
             .activator_tracked_poly()
-            .expect("Match-Pair output table missing activator");
+            .ok_or_else(|| match_pair_check_error("output table is missing its activator"))?;
+        for (table, label) in [
+            (&output_table, "output table"),
+            (&left_table, "left-key table"),
+            (&right_table, "right-key table"),
+            (&output_left_keys, "output-left-key table"),
+            (&output_right_keys, "output-right-key table"),
+            (&left_multiplicities, "left-multiplicity table"),
+            (&right_multiplicities, "right-multiplicity table"),
+        ] {
+            ensure_table_tracker_prover(&union_activator, table, label)?;
+        }
         add_output_key_equality_claims_prover(
             prover,
             &output_activator,
@@ -822,8 +946,8 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
             &output_left_keys,
             &output_right_keys,
         )?;
-        let left_mult = single_data_poly_from_table(&left_multiplicities, "left multiplicity");
-        let right_mult = single_data_poly_from_table(&right_multiplicities, "right multiplicity");
+        let left_mult = single_data_poly_from_table(&left_multiplicities, "left multiplicity")?;
+        let right_mult = single_data_poly_from_table(&right_multiplicities, "right multiplicity")?;
         let union_left = &union_activator * &(&left_mult * &right_mult);
 
         let output_sum = output_activator
@@ -855,7 +979,7 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
             .get(RIGHT_LABEL)
             .cloned()
             .unwrap_or_else(|| panic!("Match-Pair gadget missing {}", RIGHT_LABEL));
-        let _union_keys = payload
+        let union_keys = payload
             .get(UNION_LABEL)
             .cloned()
             .unwrap_or_else(|| panic!("Match-Pair gadget missing {}", UNION_LABEL));
@@ -863,6 +987,14 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
             .get(OUT_LABEL)
             .cloned()
             .unwrap_or_else(|| panic!("Match-Pair gadget missing {}", OUT_LABEL));
+        // The optional host-side honest check must apply the same structural
+        // preconditions as the proof path before it iterates evaluations.
+        // This keeps malformed row-domain metadata fail-closed instead of
+        // letting debug/release indexing behavior decide the result.
+        validate_tracked_table_row_domain(&union_keys, "Match-Pair honest-check union")?;
+        validate_tracked_table_row_domain(&left_keys, "Match-Pair honest-check left keys")?;
+        validate_tracked_table_row_domain(&right_keys, "Match-Pair honest-check right keys")?;
+        validate_tracked_table_row_domain(&output_table, "Match-Pair honest-check output")?;
         // Honest check: sum of pair multiplicities equals output active count.
         let left_counts = active_row_multiset::<B>(&left_keys);
         let right_counts = active_row_multiset::<B>(&right_keys);
@@ -916,6 +1048,15 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
         let Some(output_right_keys) = payload.get(OUTPUT_RIGHT_KEYS_LABEL).cloned() else {
             panic!("Expected output-right key table for Match-Pair gadget");
         };
+        validate_tracked_oracle_table_row_domain(&union_table, "Match-Pair union")?;
+        validate_tracked_oracle_table_row_domain(&output_table, "Match-Pair output")?;
+        validate_tracked_oracle_table_row_domain(&left_table, "Match-Pair left keys")?;
+        validate_tracked_oracle_table_row_domain(&right_table, "Match-Pair right keys")?;
+        validate_tracked_oracle_table_row_domain(&output_left_keys, "Match-Pair output-left keys")?;
+        validate_tracked_oracle_table_row_domain(
+            &output_right_keys,
+            "Match-Pair output-right keys",
+        )?;
         ensure_match_count_no_wrap::<B::F>(
             left_table.log_size(),
             right_table.log_size(),
@@ -926,13 +1067,39 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
             lookup_multiplicities_table_verifier(gadget_ready_ir, &self.left_lookup_gadget);
         let right_multiplicities =
             lookup_multiplicities_table_verifier(gadget_ready_ir, &self.right_lookup_gadget);
+        validate_tracked_oracle_table_row_domain(
+            &left_multiplicities,
+            "Match-Pair left multiplicities",
+        )?;
+        validate_tracked_oracle_table_row_domain(
+            &right_multiplicities,
+            "Match-Pair right multiplicities",
+        )?;
+        if left_multiplicities.log_size() != union_table.log_size()
+            || right_multiplicities.log_size() != union_table.log_size()
+        {
+            return Err(match_pair_check_error(
+                "union and lookup multiplicities must share one row domain",
+            ));
+        }
 
         let union_activator = union_table
             .activator_tracked_poly()
-            .expect("Match-Pair union table missing activator");
+            .ok_or_else(|| match_pair_check_error("union table is missing its activator"))?;
         let output_activator = output_table
             .activator_tracked_poly()
-            .expect("Match-Pair output table missing activator");
+            .ok_or_else(|| match_pair_check_error("output table is missing its activator"))?;
+        for (table, label) in [
+            (&output_table, "output table"),
+            (&left_table, "left-key table"),
+            (&right_table, "right-key table"),
+            (&output_left_keys, "output-left-key table"),
+            (&output_right_keys, "output-right-key table"),
+            (&left_multiplicities, "left-multiplicity table"),
+            (&right_multiplicities, "right-multiplicity table"),
+        ] {
+            ensure_table_tracker_verifier(&union_activator, table, label)?;
+        }
         add_output_key_equality_claims_verifier(
             verifier,
             &output_activator,
@@ -941,8 +1108,9 @@ impl<B: SnarkBackend> IsGadgetNode<B> for GadgetNode<B> {
             &output_right_keys,
         )?;
 
-        let left_mult = single_data_oracle_from_table(&left_multiplicities, "left multiplicity");
-        let right_mult = single_data_oracle_from_table(&right_multiplicities, "right multiplicity");
+        let left_mult = single_data_oracle_from_table(&left_multiplicities, "left multiplicity")?;
+        let right_mult =
+            single_data_oracle_from_table(&right_multiplicities, "right multiplicity")?;
 
         let union_left = &union_activator * &(&left_mult * &right_mult);
 
@@ -972,6 +1140,10 @@ impl<B: SnarkBackend> GadgetNode<B> {
     pub fn new() -> Self {
         let union_activator_bool_gadget =
             Arc::new(Node::<B>::Gadget(Arc::new(bool_check::GadgetNode::new())));
+        let left_activator_bool_gadget =
+            Arc::new(Node::<B>::Gadget(Arc::new(bool_check::GadgetNode::new())));
+        let right_activator_bool_gadget =
+            Arc::new(Node::<B>::Gadget(Arc::new(bool_check::GadgetNode::new())));
         let nodup_gadget = Arc::new(Node::<B>::Gadget(Arc::new(
             crate::irs::nodes::utils::nodup::GadgetNode::default(),
         )));
@@ -983,6 +1155,8 @@ impl<B: SnarkBackend> GadgetNode<B> {
         )));
         Self {
             union_activator_bool_gadget,
+            left_activator_bool_gadget,
+            right_activator_bool_gadget,
             nodup_gadget,
             left_lookup_gadget,
             right_lookup_gadget,
@@ -990,80 +1164,86 @@ impl<B: SnarkBackend> GadgetNode<B> {
     }
 }
 
-/// Reinterpret the union activator as ordinary data with no gating activator.
+/// Reinterpret a table activator as ordinary data with no gating activator.
 ///
 /// BoolCheck gates a data column when its table carries an activator.  Here the
 /// value being checked *is* the activator, so attaching it again as a gate would
 /// accept arbitrary values at zero-weight slots.  The synthetic one-column
 /// table deliberately has no system activator and therefore checks every slot.
-fn union_activator_bool_table_prover<B: SnarkBackend>(
-    union: &arithmetic::table::TrackedTable<B>,
-) -> arithmetic::table::TrackedTable<B> {
-    let activator = union
+fn activator_bool_table_prover<B: SnarkBackend>(
+    table: &arithmetic::table::TrackedTable<B>,
+    field_name: &str,
+) -> ark_piop::errors::SnarkResult<arithmetic::table::TrackedTable<B>> {
+    let activator = table
         .activator_tracked_poly()
-        .expect("Match-Pair union table should carry an activator column");
-    let field = Arc::new(Field::new("union_activator", DataType::Boolean, false));
+        .ok_or_else(|| match_pair_check_error("Booleanity input is missing its activator"))?;
+    let field = Arc::new(Field::new(field_name, DataType::Boolean, false));
     let mut tracked_polys = IndexMap::new();
     tracked_polys.insert(field.clone(), activator);
-    arithmetic::table::TrackedTable::new(
+    Ok(arithmetic::table::TrackedTable::new(
         Some(Schema::new(vec![field.as_ref().clone()])),
         tracked_polys,
-        union.log_size(),
-    )
+        table.log_size(),
+    ))
 }
 
-fn union_activator_bool_table_verifier<B: SnarkBackend>(
-    union: &arithmetic::table_oracle::TrackedTableOracle<B>,
-) -> arithmetic::table_oracle::TrackedTableOracle<B> {
-    let activator = union
+fn activator_bool_table_verifier<B: SnarkBackend>(
+    table: &arithmetic::table_oracle::TrackedTableOracle<B>,
+    field_name: &str,
+) -> ark_piop::errors::SnarkResult<arithmetic::table_oracle::TrackedTableOracle<B>> {
+    let activator = table
         .activator_tracked_poly()
-        .expect("Match-Pair union table should carry an activator column");
-    let field = Arc::new(Field::new("union_activator", DataType::Boolean, false));
+        .ok_or_else(|| match_pair_check_error("Booleanity input is missing its activator"))?;
+    let field = Arc::new(Field::new(field_name, DataType::Boolean, false));
     let mut tracked_oracles = IndexMap::new();
     tracked_oracles.insert(field.clone(), activator);
-    arithmetic::table_oracle::TrackedTableOracle::new(
+    Ok(arithmetic::table_oracle::TrackedTableOracle::new(
         Some(Schema::new(vec![field.as_ref().clone()])),
         tracked_oracles,
-        union.log_size(),
-    )
+        table.log_size(),
+    ))
 }
 
-fn populate_union_activator_bool_payload_prover<B: SnarkBackend>(
+fn populate_activator_bool_payload_prover<B: SnarkBackend>(
     bool_gadget: &Arc<Node<B>>,
-    union: &arithmetic::table::TrackedTable<B>,
+    table: &arithmetic::table::TrackedTable<B>,
+    field_name: &str,
     virtualized_ir: &mut crate::prover::irs::VirtualizedIr<B>,
-) {
+) -> ark_piop::errors::SnarkResult<()> {
     let mut bool_payload = match virtualized_ir.payload_for_node(&bool_gadget.id()) {
         Some(PayloadStructure::GadgetPayload(map)) => map.clone(),
         _ => IndexMap::new(),
     };
     bool_payload.insert(
         bool_check::TABLE_LABEL.to_string(),
-        union_activator_bool_table_prover(union),
+        activator_bool_table_prover(table, field_name)?,
     );
     virtualized_ir.set_payload_for_node(
         bool_gadget.id(),
         Some(PayloadStructure::GadgetPayload(bool_payload)),
     );
+    Ok(())
 }
 
-fn populate_union_activator_bool_payload_verifier<B: SnarkBackend>(
+fn populate_activator_bool_payload_verifier<B: SnarkBackend>(
     bool_gadget: &Arc<Node<B>>,
-    union: &arithmetic::table_oracle::TrackedTableOracle<B>,
+    table: &arithmetic::table_oracle::TrackedTableOracle<B>,
+    field_name: &str,
     virtualized_ir: &mut crate::verifier::irs::VirtualizedIr<B>,
-) {
+) -> ark_piop::errors::SnarkResult<()> {
     let mut bool_payload = match virtualized_ir.payload_for_node(&bool_gadget.id()) {
         Some(PayloadStructure::GadgetPayload(map)) => map.clone(),
         _ => IndexMap::new(),
     };
     bool_payload.insert(
         bool_check::TABLE_LABEL.to_string(),
-        union_activator_bool_table_verifier(union),
+        activator_bool_table_verifier(table, field_name)?,
     );
     virtualized_ir.set_payload_for_node(
         bool_gadget.id(),
         Some(PayloadStructure::GadgetPayload(bool_payload)),
     );
+    Ok(())
 }
 
 fn drop_row_id_keep_activator_prover<B: SnarkBackend>(
@@ -1169,30 +1349,36 @@ fn lookup_multiplicities_table_verifier<B: SnarkBackend>(
 fn single_data_poly_from_table<B: SnarkBackend>(
     table: &arithmetic::table::TrackedTable<B>,
     label: &str,
-) -> TrackedPoly<B> {
+) -> ark_piop::errors::SnarkResult<TrackedPoly<B>> {
+    validate_tracked_table_row_domain(table, &format!("Match-Pair {label}"))?;
     let data_indices = table.data_tracked_polys_indices();
     if data_indices.len() != 1 {
-        panic!("Match-Pair {label} table must have exactly one data column");
+        return Err(match_pair_check_error(&format!(
+            "{label} table must have exactly one data column"
+        )));
     }
     let data_cols = table.tracked_polys();
     let (_, poly) = data_cols
         .get_index(data_indices[0])
-        .expect("Match-Pair multiplicity column missing");
-    poly.clone()
+        .ok_or_else(|| match_pair_check_error("multiplicity column is missing"))?;
+    Ok(poly.clone())
 }
 fn single_data_oracle_from_table<B: SnarkBackend>(
     table: &arithmetic::table_oracle::TrackedTableOracle<B>,
     label: &str,
-) -> TrackedOracle<B> {
+) -> ark_piop::errors::SnarkResult<TrackedOracle<B>> {
+    validate_tracked_oracle_table_row_domain(table, &format!("Match-Pair {label}"))?;
     let data_indices = table.data_tracked_oracles_indices();
     if data_indices.len() != 1 {
-        panic!("Match-Pair {label} table must have exactly one data column");
+        return Err(match_pair_check_error(&format!(
+            "{label} table must have exactly one data column"
+        )));
     }
     let data_cols = table.tracked_oracles();
     let (_, oracle) = data_cols
         .get_index(data_indices[0])
-        .expect("Match-Pair multiplicity column missing");
-    oracle.clone()
+        .ok_or_else(|| match_pair_check_error("multiplicity oracle is missing"))?;
+    Ok(oracle.clone())
 }
 
 fn active_row_multiset<B: SnarkBackend>(
